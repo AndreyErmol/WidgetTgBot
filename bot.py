@@ -7,6 +7,7 @@ import random
 import threading
 import time
 import zlib
+from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -15,8 +16,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BASE = Path(__file__).resolve().parent
+ASSETS = (('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('BNB', 'bnb'), ('XRP', 'xrp'),
+          ('SUI', 'sui'), ('SOL', 'solana'), ('TRX', 'tron'), ('HYPE', 'hyperliquid'),
+          ('ZEC', 'zcash'), ('DOGE', 'dogecoin'))
 TOKEN = ''
-STOP = threading.Event()
 LOCK = threading.RLock()
 SEND_LOCK = threading.Lock()
 STATE = {'coins': [], 'ct': 0, 'fx': None, 'ft': 0}
@@ -27,6 +30,22 @@ class APIError(Exception):
     def __init__(self, message, limited=False, retry=0):
         super().__init__(message)
         self.limited, self.retry = limited, retry
+
+
+class RateLimiter:
+    def __init__(self, limit=50, period=60, clock=time.monotonic):
+        self.limit, self.period, self.clock = limit, period, clock
+        self.lock, self.attempts = threading.Lock(), deque()
+
+    def reserve(self):
+        with self.lock:
+            now = self.clock()
+            while self.attempts and self.attempts[0] <= now - self.period:
+                self.attempts.popleft()
+            if len(self.attempts) >= self.limit:
+                return False
+            self.attempts.append(now)
+            return True
 
 
 def retry_seconds(value):
@@ -41,7 +60,7 @@ def retry_seconds(value):
 
 def json_request(url, params=None):
     body = None if params is None else json.dumps(params).encode()
-    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/4',
+    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/5',
                                               'Content-Type': 'application/json'})
     try:
         with urlopen(request, timeout=40 if params is not None else 8) as response:
@@ -63,16 +82,12 @@ def json_request(url, params=None):
 
 class Cache:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.values = {}
-        self.until = 0
-        self.failures = 0
+        self.lock, self.values = threading.Lock(), {}
+        self.until, self.failures = 0, 0
 
     def get(self, key, loader, ttl=10):
-        # One loader at a time; concurrent callers reuse the same response.
         with self.lock:
-            now = time.monotonic()
-            old = self.values.get(key)
+            now, old = time.monotonic(), self.values.get(key)
             if old and (now < old[2] or now < self.until):
                 return old[:2]
             if now < self.until:
@@ -86,24 +101,21 @@ class Cache:
                     delay = max(60, delay, error.retry)
                 self.until = time.monotonic() + delay + random.uniform(0, 1)
                 raise
-            self.failures = 0
-            self.until = 0
+            self.failures, self.until = 0, 0
             entry = (data, int(time.time()), time.monotonic() + ttl)
             self.values[key] = entry
             return entry[:2]
 
 
 CMC_CACHE, FX_CACHE = Cache(), Cache()
-TG_LOCK = threading.Lock()
+CMC_LIMIT = RateLimiter()
 TG_UNTIL = 0
 
 
 def api(method, **params):
     global TG_UNTIL
-    with TG_LOCK:
-        if time.monotonic() < TG_UNTIL:
-            raise APIError('Telegram cooldown')
-    # Long polling must not block publishing or sending widgets.
+    if time.monotonic() < TG_UNTIL:
+        raise APIError('Telegram cooldown')
     try:
         payload = json_request(f'https://api.telegram.org/bot{TOKEN}/{method}', params)
         if not payload.get('ok'):
@@ -113,28 +125,8 @@ def api(method, **params):
         return payload['result']
     except APIError as error:
         if error.limited:
-            with TG_LOCK:
-                TG_UNTIL = max(TG_UNTIL, time.monotonic() + max(1, error.retry or 60))
+            TG_UNTIL = max(TG_UNTIL, time.monotonic() + max(1, error.retry or 60))
         raise APIError(f'Telegram/{method}: {error}', error.limited, error.retry) from None
-
-
-def cmc(path, **params):
-    key = path + '?' + urlencode(sorted(params.items()))
-    def load():
-        response = json_request('https://pro-api.coinmarketcap.com/public-api/' + key)
-        status = response.get('status', {})
-        code = int(status.get('error_code') or 0)
-        if code:
-            raise APIError(str(status.get('error_message', 'CMC error')),
-                           code in (429, 1008, 1009, 1010), 60)
-        return response['data']
-    return CMC_CACHE.get(key, load)
-
-
-def records(data):
-    if isinstance(data, list):
-        return data
-    return [item for value in data.values() for item in (value if isinstance(value, list) else [value])]
 
 
 def finite(value, positive=False):
@@ -142,6 +134,12 @@ def finite(value, positive=False):
     if not math.isfinite(number) or (positive and number <= 0):
         raise ValueError('Invalid numeric quote')
     return number
+
+
+def records(data):
+    if isinstance(data, list):
+        return data
+    return [item for value in data.values() for item in (value if isinstance(value, list) else [value])]
 
 
 def coin(item):
@@ -152,24 +150,32 @@ def coin(item):
             'p': finite(usd['price'], True), 'c': finite(usd['percent_change_24h'])}
 
 
-def select_coins(items, sui):
-    others = sorted({c['id']: c for c in items if c['id'] != sui['id'] and
-                     c['symbol'].upper() not in ('USDT', 'USDC')}.values(), key=lambda c: c['rank'])[:9]
-    if len(others) != 9:
-        raise ValueError('Need nine eligible coins plus Sui')
-    return others[:4] + [sui] + others[4:]
+def order_coins(items):
+    by_slug = {c.get('slug'): c for c in items}
+    ordered = []
+    for symbol, slug in ASSETS:
+        c = by_slug.get(slug)
+        if c is None or c['symbol'].upper() != symbol:
+            raise ValueError(f'Missing or mismatched quote: {symbol}/{slug}')
+        ordered.append(c)
+    return ordered
 
 
 def fetch_coins():
-    data, stamp = cmc('v3/cryptocurrency/listings/latest', start=1, limit=100,
-                      convert='USD', sort='market_cap', sort_dir='desc')
-    items = list(map(coin, records(data)))
-    sui = next((c for c in items if c['slug'] == 'sui'), None)
-    if sui is None:
-        extra, extra_stamp = cmc('v3/cryptocurrency/quotes/latest', slug='sui', convert='USD')
-        sui = coin(next(c for c in records(extra) if c.get('slug') == 'sui'))
-        stamp = min(stamp, extra_stamp)
-    return select_coins(items, sui), stamp
+    params = {'slug': ','.join(slug for _, slug in ASSETS), 'convert': 'USD'}
+    key = 'v3/cryptocurrency/quotes/latest?' + urlencode(params)
+    def load():
+        if not CMC_LIMIT.reserve():
+            raise APIError('Local CMC limit: 50 attempts per rolling 60 seconds')
+        response = json_request('https://pro-api.coinmarketcap.com/public-api/' + key)
+        status = response.get('status', {})
+        code = int(status.get('error_code') or 0)
+        if code:
+            raise APIError(str(status.get('error_message', 'CMC error')),
+                           code in (429, 1008, 1009, 1010), 60)
+        # Validate all ten assets before caching or replacing the last snapshot.
+        return order_coins(list(map(coin, records(response['data']))))
+    return CMC_CACHE.get(key, load, ttl=10)
 
 
 def format_price(value):
@@ -182,17 +188,14 @@ def format_price(value):
 
 def format_percent(value):
     number = round(finite(value), 2)
-    if number == 0:
-        number = 0.0
-    return f'{number:+.2f}'.replace('.', ',') + '%'
+    return f'{number if number else 0.0:+.2f}'.replace('.', ',') + '%'
 
 
 def pack():
     with LOCK:
-        snapshot = dict(STATE)
-        coins = [dict(c) for c in STATE['coins']]
-    for name_limit in (20, 12, 6, 0):
-        rows = [[c['id'], c['name'][:name_limit], c['symbol'][:12], c['rank'],
+        snapshot, coins = dict(STATE), [dict(c) for c in STATE['coins']]
+    for size in (20, 12, 6, 0):
+        rows = [[c['id'], c['name'][:size], c['symbol'], c['rank'],
                  format_price(c['p']), format_percent(c['c']), int(c['c'] >= 0)] for c in coins]
         state = {'r': time.time_ns() // 1000, 't': snapshot['ct'], 'q': rows,
                  'f': format_price(snapshot['fx']) if snapshot['fx'] else None}
@@ -204,21 +207,21 @@ def pack():
 
 def persist():
     with LOCK:
-        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=4)
+        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=5)
         tmp = BASE / 'runtime.json.tmp'
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         tmp.replace(BASE / 'runtime.json')
 
 
-def source_loop():
-    while not STOP.is_set():
-        started = time.monotonic()
+def refresh_on_demand():
+    if not STATE['coins'] or time.time() - STATE['ct'] >= 10:
         try:
             coins, stamp = fetch_coins()
             with LOCK:
                 STATE.update(coins=coins, ct=stamp)
         except Exception as error:
-            logging.warning('CMC: %s; keeping cached prices', error)
+            logging.warning('CMC: %s; serving local prices', error)
+    if STATE['fx'] is None or time.time() - STATE['ft'] >= 60:
         try:
             def load_fx():
                 data = json_request('https://api.coinbase.com/v2/exchange-rates?currency=USD')['data']
@@ -229,40 +232,53 @@ def source_loop():
             with LOCK:
                 STATE.update(fx=rate, ft=stamp)
         except Exception as error:
-            logging.warning('Coinbase: %s; keeping cached rate', error)
-        try:
-            with LOCK:
-                widget_id = SAVED.get('widget_id')
-            if widget_id:
-                api('editSharedWidgetData', widget_id=widget_id, public_data=pack(), cache_time=10)
-            persist()
-        except Exception as error:
-            logging.warning('Publish/save: %s', error)
-        STOP.wait(max(0, 10 - (time.monotonic() - started)))
+            logging.warning('Coinbase: %s; serving local rate', error)
 
 
 def send_widget(chat_id):
-    # No market-data calls here: all viewers use one in-memory snapshot.
     with SEND_LOCK:
+        refresh_on_demand()
+        persist()
         markup = (BASE / 'widget.html').read_text(encoding='utf-8')
         raw = markup.encode()
         if len(raw) > 32768 or len(zlib.compress(raw, 9)) > 4096 or b'\x00' in raw:
             raise ValueError('HTML exceeds Telegram limits')
-        digest = hashlib.sha256(raw).hexdigest()
-        with LOCK:
-            widget_id = SAVED.get('widget_id') if SAVED.get('template') == digest else None
+        digest, state = hashlib.sha256(raw).hexdigest(), pack()
+        content = json.loads(state)
+        content.pop('r', None)
+        content_hash = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        widget_id = SAVED.get('widget_id') if SAVED.get('template') == digest else None
         if widget_id:
+            if SAVED.get('content_hash') != content_hash:
+                try:
+                    api('editSharedWidgetData', widget_id=widget_id, public_data=state, cache_time=10)
+                    SAVED['content_hash'] = content_hash
+                except APIError as error:
+                    logging.warning('Shared data update failed: %s', error)
             api('sendSharedWidget', chat_id=chat_id, widget_id=widget_id)
         else:
             result = api('sendWidget', chat_id=chat_id, html=markup, width=360, height=0,
-                         is_shared=True, public_data=pack())
-            with LOCK:
-                SAVED.update(widget_id=result['widget']['id'], template=digest)
-            persist()
+                         is_shared=True, public_data=state)
+            SAVED.update(widget_id=result['widget']['id'], template=digest, content_hash=content_hash)
+        persist()
+
+
+def restore(saved):
+    if saved.get('bot') != TOKEN.split(':')[0]:
+        return
+    old = saved.get('state', {}) if saved.get('version') in (4, 5) else saved
+    try:
+        coins = order_coins(old.get('coins', []))
+    except (ValueError, KeyError, TypeError):
+        coins = []
+    STATE.update(coins=coins, ct=old.get('ct', 0) if coins else 0,
+                 fx=old.get('fx'), ft=old.get('ft', 0))
+    if saved.get('version') == 5:
+        SAVED.update(saved)
 
 
 def main():
-    global TOKEN, SAVED
+    global TOKEN
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     TOKEN = os.environ.get('BOT_TOKEN', '').strip()
     if not TOKEN:
@@ -270,53 +286,33 @@ def main():
     allowed = int(os.environ.get('ALLOWED_USER_ID', '0'))
     path = BASE / 'runtime.json'
     if path.exists():
-        saved = json.loads(path.read_text(encoding='utf-8'))
-        if saved.get('bot') == TOKEN.split(':')[0]:
-            if saved.get('version') == 4:
-                SAVED = saved
-                STATE.update(saved.get('state', {}))
-            elif saved.get('version') == 3:
-                # Keep useful old prices, never reuse the old layout.
-                coins = saved.get('coins', [])
-                sui = next((c for c in coins if c['symbol'].upper() == 'SUI'), None)
-                try:
-                    STATE['coins'] = select_coins(coins, sui) if sui else []
-                except (ValueError, TypeError):
-                    STATE['coins'] = []
-                STATE.update(fx=saved.get('fx'), ft=saved.get('ft', 0), ct=saved.get('ct', 0))
+        restore(json.loads(path.read_text(encoding='utf-8')))
     me = api('getMe')
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
-    worker = threading.Thread(target=source_loop, daemon=True)
-    worker.start()
     offset = None
-    logging.info('Started @%s. Send /widget.', me.get('username'))
-    try:
-        while not STOP.is_set():
-            try:
-                params = {'timeout': 25, 'allowed_updates': ['message']}
-                if offset is not None:
-                    params['offset'] = offset
-                for update in api('getUpdates', **params):
-                    message = update.get('message', {})
-                    chat = message.get('chat', {})
-                    if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
-                        words = message.get('text', '').split()
-                        command = words[0].split('@')[0] if words else ''
-                        try:
-                            if command in ('/widget', '/prices'):
-                                send_widget(chat['id'])
-                            elif command in ('/start', '/help'):
-                                api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget')
-                        except Exception as error:
-                            logging.error('Command: %s', error)
-                    offset = update['update_id'] + 1
-            except Exception as error:
-                logging.warning('Polling: %s', error)
-                STOP.wait(5)
-    finally:
-        STOP.set()
-        worker.join(timeout=12)
+    logging.info('Started @%s. Demand-only fixed watchlist; send /widget.', me.get('username'))
+    while True:
+        try:
+            params = {'timeout': 25, 'allowed_updates': ['message']}
+            if offset is not None:
+                params['offset'] = offset
+            for update in api('getUpdates', **params):
+                message, chat = update.get('message', {}), update.get('message', {}).get('chat', {})
+                if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
+                    words = message.get('text', '').split()
+                    command = words[0].split('@')[0] if words else ''
+                    try:
+                        if command in ('/widget', '/prices'):
+                            send_widget(chat['id'])
+                        elif command in ('/start', '/help'):
+                            api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены обновляются по запросу.')
+                    except Exception as error:
+                        logging.error('Command: %s', error)
+                offset = update['update_id'] + 1
+        except Exception as error:
+            logging.warning('Polling: %s', error)
+            time.sleep(5)
 
 
 if __name__ == '__main__':

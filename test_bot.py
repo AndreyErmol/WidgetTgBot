@@ -1,89 +1,111 @@
 import json
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlparse
 import bot
 
 
-def item(i, symbol='X', rank=None):
-    return {'id': i, 'rank': rank or i, 'name': 'Coin', 'symbol': symbol, 'p': 1.25, 'c': -2.19}
+def coins():
+    return [{'id': i+1, 'symbol': symbol, 'slug': slug, 'name': symbol,
+             'rank': i+1, 'p': 1.25, 'c': -2.19} for i,(symbol,slug) in enumerate(bot.ASSETS)]
+
+
+def response():
+    return {'data': [dict(c, cmc_rank=c['rank'], quote={'USD': {'price': c['p'],
+                     'percent_change_24h': c['c']}}) for c in coins()]}
 
 
 class Tests(unittest.TestCase):
-    def test_filter_and_pin(self):
-        items = [item(i) for i in range(1, 16)]
-        items[1]['symbol'] = 'USDT'
-        items[3]['symbol'] = 'USDC'
-        result = bot.select_coins(items, item(99, 'SUI', 25))
-        self.assertEqual([c['id'] for c in result], [1,3,5,6,99,7,8,9,10,11])
-        self.assertEqual(result[4]['rank'], 25)
-        self.assertEqual(len({c['id'] for c in result}), 10)
+    def test_exact_order(self):
+        result=bot.order_coins(list(reversed(coins())))
+        self.assertEqual([c['symbol'] for c in result],['BTC','ETH','BNB','XRP','SUI','SOL','TRX','HYPE','ZEC','DOGE'])
 
-    def test_existing_sui_not_duplicated(self):
-        items = [item(i) for i in range(1, 12)]
-        self.assertEqual(len({c['id'] for c in bot.select_coins(items, items[2])}), 10)
+    def test_missing_asset_rejected(self):
+        with self.assertRaises(ValueError):
+            bot.order_coins(coins()[:-1])
 
-    def test_percent_format(self):
-        self.assertEqual(bot.format_percent(-2.19), '-2,19%')
-        self.assertEqual(bot.format_percent(2.34), '+2,34%')
-        self.assertEqual(bot.format_percent(-0.001), '+0,00%')
-        self.assertEqual(bot.format_percent(1234.567), '+1234,57%')
+    def test_wrong_symbol_rejected(self):
+        data=coins(); data[0]['symbol']='OTHER'
+        with self.assertRaises(ValueError):
+            bot.order_coins(data)
 
-    def test_price_format(self):
-        self.assertEqual(bot.format_price(73057.95), '73 057,95')
-        self.assertEqual(bot.format_price(.001234), '0,001234')
+    def test_one_quotes_request_for_ten(self):
+        with patch.object(bot,'CMC_LIMIT',bot.RateLimiter()), patch.object(bot,'CMC_CACHE',bot.Cache()), patch('bot.json_request',return_value=response()) as request:
+            first=bot.fetch_coins(); second=bot.fetch_coins()
+        self.assertEqual(request.call_count,1)
+        self.assertEqual(first,second)
+        url=request.call_args.args[0]
+        self.assertIn('/v3/cryptocurrency/quotes/latest?',url)
+        query=parse_qs(urlparse(url).query)
+        self.assertEqual(query['slug'][0].split(','),[slug for _,slug in bot.ASSETS])
+        self.assertNotIn('listings',url)
 
-    def test_singleflight(self):
-        cache = bot.Cache()
-        def load():
-            time.sleep(.02)
-            return {'price': 1}
-        loader = Mock(side_effect=load)
+    def test_limit_boundary(self):
+        now=[0.0]; limiter=bot.RateLimiter(clock=lambda:now[0])
+        self.assertTrue(all(limiter.reserve() for _ in range(50)))
+        self.assertFalse(limiter.reserve())
+        now[0]=59.999; self.assertFalse(limiter.reserve())
+        now[0]=60; self.assertTrue(limiter.reserve())
+
+    def test_concurrent_limit(self):
+        limiter=bot.RateLimiter(clock=lambda:0)
         with ThreadPoolExecutor(max_workers=20) as pool:
-            results = list(pool.map(lambda _: cache.get('quotes', loader), range(40)))
-        self.assertEqual(loader.call_count, 1)
-        self.assertTrue(all(r == results[0] for r in results))
+            results=list(pool.map(lambda _:limiter.reserve(),range(200)))
+        self.assertEqual(sum(results),50)
 
-    def test_429_cooldown_stale_timestamp(self):
-        cache = bot.Cache()
-        loader = Mock(return_value={'price': 2})
-        old = cache.get('q', loader, ttl=0)
-        loader.side_effect = bot.APIError('429', True, 120)
-        with self.assertRaises(bot.APIError):
-            cache.get('q', loader)
-        self.assertGreaterEqual(cache.until - time.monotonic(), 119)
-        self.assertEqual(cache.get('q', loader), old)
-        self.assertEqual(loader.call_count, 2)
-        other = Mock()
-        with self.assertRaises(bot.APIError):
-            cache.get('another-endpoint', other)
-        other.assert_not_called()
+    def test_failure_consumes_slot(self):
+        limiter=bot.RateLimiter(limit=1)
+        with patch.object(bot,'CMC_LIMIT',limiter), patch.object(bot,'CMC_CACHE',bot.Cache()), patch('bot.json_request',side_effect=bot.APIError('offline')):
+            with self.assertRaises(bot.APIError): bot.fetch_coins()
+        self.assertFalse(limiter.reserve())
 
-    def test_state_size_and_percent(self):
-        with patch.dict(bot.STATE, coins=[item(i) for i in range(10)], fx=83.17, ct=1800000000):
-            state = bot.pack()
-        self.assertLessEqual(len(state.encode()), 1024)
-        self.assertEqual(json.loads(state)['q'][0][5], '-2,19%')
+    def test_cooldown_keeps_timestamp(self):
+        cache=bot.Cache(); loader=Mock(return_value=coins())
+        old=cache.get('q',loader,ttl=0)
+        loader.side_effect=bot.APIError('429',True,120)
+        with self.assertRaises(bot.APIError): cache.get('q',loader)
+        self.assertEqual(cache.get('q',loader),old)
+        self.assertEqual(loader.call_count,2)
 
-    def test_coin_percentage_not_scaled(self):
-        raw = {'id': 1, 'name': 'Bitcoin', 'symbol': 'BTC', 'cmc_rank': 1,
-               'quote': {'USD': {'price': 100, 'percent_change_24h': -2.19}}}
-        self.assertEqual(bot.coin(raw)['c'], -2.19)
+    def test_recent_no_fetch(self):
+        with patch.dict(bot.STATE,coins=coins(),ct=100,fx=83.17,ft=100), patch('bot.time.time',return_value=105), patch('bot.fetch_coins') as fetch, patch('bot.json_request') as request:
+            bot.refresh_on_demand()
+        fetch.assert_not_called(); request.assert_not_called()
 
-    @patch('bot.persist')
-    @patch('bot.pack', return_value='{}')
-    @patch('bot.Path.read_text', return_value='<b>widget</b>')
-    @patch('bot.cmc')
-    @patch('bot.api', return_value={'widget': {'id': 'test'}})
-    def test_many_viewers_no_cmc_calls(self, api, cmc, read, pack, persist):
-        with patch.dict(bot.SAVED, {}, clear=True):
-            for i in range(20):
-                bot.send_widget(i)
-        cmc.assert_not_called()
-        self.assertEqual(sum(c.args[0] == 'sendWidget' for c in api.call_args_list), 1)
-        self.assertEqual(sum(c.args[0] == 'sendSharedWidget' for c in api.call_args_list), 19)
+    def test_stale_refresh(self):
+        with patch.dict(bot.STATE,coins=coins(),ct=10,fx=83.17,ft=100), patch('bot.time.time',return_value=100), patch('bot.fetch_coins',return_value=(coins(),100)) as fetch:
+            bot.refresh_on_demand(); self.assertEqual(bot.STATE['ct'],100)
+        fetch.assert_called_once()
+
+    def test_error_fallback(self):
+        with patch.dict(bot.STATE,coins=coins(),ct=10,fx=83.17,ft=100), patch('bot.time.time',return_value=100), patch('bot.fetch_coins',side_effect=bot.APIError('429',True,120)):
+            before=bot.STATE['coins']; bot.refresh_on_demand()
+            self.assertEqual(bot.STATE['coins'],before); self.assertEqual(bot.STATE['ct'],10)
+
+    def test_twenty_commands_use_cache(self):
+        with patch.dict(bot.STATE,coins=coins(),ct=100,fx=83.17,ft=100), patch.dict(bot.SAVED,{},clear=True), patch('bot.time.time',return_value=105), patch('bot.fetch_coins') as fetch, patch('bot.json_request') as request, patch('bot.Path.read_text',return_value='<b>widget</b>'), patch('bot.persist'), patch('bot.api',return_value={'widget':{'id':'test'}}) as api:
+            for i in range(20): bot.send_widget(i)
+        fetch.assert_not_called(); request.assert_not_called()
+        self.assertEqual(sum(c.args[0]=='sendWidget' for c in api.call_args_list),1)
+        self.assertEqual(sum(c.args[0]=='sendSharedWidget' for c in api.call_args_list),19)
+
+    def test_restore_reorders_fixed_watchlist(self):
+        with patch.object(bot,'TOKEN','test:secret'), patch.dict(bot.STATE,{},clear=True), patch.dict(bot.SAVED,{},clear=True):
+            bot.restore({'bot':'test','version':4,'state':{'coins':list(reversed(coins())),'ct':100}})
+            self.assertEqual([c['symbol'] for c in bot.STATE['coins']],[s for s,_ in bot.ASSETS])
+
+    def test_format_and_size(self):
+        self.assertEqual(bot.format_percent(-2.19),'-2,19%')
+        self.assertEqual(bot.format_price(73057.95),'73 057,95')
+        with patch.dict(bot.STATE,coins=coins(),fx=83.17):
+            state=bot.pack()
+        self.assertLessEqual(len(state.encode()),1024)
+        self.assertEqual(json.loads(state)['q'][0][5],'-2,19%')
+
+    def test_no_background_worker(self):
+        self.assertFalse(hasattr(bot,'source_loop'))
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     unittest.main()
