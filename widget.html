@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: system-ui; text-align: center; }
+h3 { margin: 8px 0; }
+#count { font-size: 36px; margin: 12px 0; }
+button { min-width: 120px; padding: 10px 24px; }
+</style>
+</head>
+<body>
+<h3>Счётчик нажатий</h3>
+<p id="count">0</p>
+<button id="increment">+1</button>
+<script>
+let count = 0;
+const output = document.getElementById('count');
+document.getElementById('increment').addEventListener('click', function () {
+  count += 1;
+  output.textContent = String(count);
+});
+</script>
+</body>
+</html>
