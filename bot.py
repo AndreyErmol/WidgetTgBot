@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import random
+import sys
 import threading
 import time
 import zlib
@@ -58,12 +59,13 @@ def retry_seconds(value):
             return 0
 
 
-def json_request(url, params=None):
+def json_request(url, params=None, timeout=None):
     body = None if params is None else json.dumps(params).encode()
-    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/5',
+    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/6',
                                               'Content-Type': 'application/json'})
     try:
-        with urlopen(request, timeout=40 if params is not None else 8) as response:
+        seconds = timeout if timeout is not None else (40 if params is not None else 8)
+        with urlopen(request, timeout=seconds) as response:
             return json.load(response)
     except HTTPError as error:
         retry = retry_seconds(error.headers.get('Retry-After'))
@@ -110,14 +112,17 @@ class Cache:
 CMC_CACHE, FX_CACHE = Cache(), Cache()
 CMC_LIMIT = RateLimiter()
 TG_UNTIL = 0
+TG_LOCK = threading.Lock()
 
 
 def api(method, **params):
     global TG_UNTIL
-    if time.monotonic() < TG_UNTIL:
-        raise APIError('Telegram cooldown')
+    with TG_LOCK:
+        if time.monotonic() < TG_UNTIL:
+            raise APIError('Telegram cooldown')
     try:
-        payload = json_request(f'https://api.telegram.org/bot{TOKEN}/{method}', params)
+        url = f'https://api.telegram.org/bot{TOKEN}/{method}'
+        payload = json_request(url, params, timeout=5 if method == 'answerWidgetQuery' else None)
         if not payload.get('ok'):
             raise APIError(str(payload.get('description', 'Telegram error')).replace(TOKEN, '<redacted>'),
                            payload.get('error_code') == 429,
@@ -125,7 +130,8 @@ def api(method, **params):
         return payload['result']
     except APIError as error:
         if error.limited:
-            TG_UNTIL = max(TG_UNTIL, time.monotonic() + max(1, error.retry or 60))
+            with TG_LOCK:
+                TG_UNTIL = max(TG_UNTIL, time.monotonic() + max(1, error.retry or 60))
         raise APIError(f'Telegram/{method}: {error}', error.limited, error.retry) from None
 
 
@@ -173,7 +179,6 @@ def fetch_coins():
         if code:
             raise APIError(str(status.get('error_message', 'CMC error')),
                            code in (429, 1008, 1009, 1010), 60)
-        # Validate all ten assets before caching or replacing the last snapshot.
         return order_coins(list(map(coin, records(response['data']))))
     return CMC_CACHE.get(key, load, ttl=10)
 
@@ -207,7 +212,7 @@ def pack():
 
 def persist():
     with LOCK:
-        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=5)
+        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=6)
         tmp = BASE / 'runtime.json.tmp'
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         tmp.replace(BASE / 'runtime.json')
@@ -258,7 +263,7 @@ def send_widget(chat_id):
             api('sendSharedWidget', chat_id=chat_id, widget_id=widget_id)
         else:
             result = api('sendWidget', chat_id=chat_id, html=markup, width=360, height=0,
-                         is_shared=True, public_data=state)
+                         is_shared=True, allow_queries=True, public_data=state)
             SAVED.update(widget_id=result['widget']['id'], template=digest, content_hash=content_hash)
         persist()
 
@@ -266,18 +271,19 @@ def send_widget(chat_id):
 def restore(saved):
     if saved.get('bot') != TOKEN.split(':')[0]:
         return
-    old = saved.get('state', {}) if saved.get('version') in (4, 5) else saved
+    old = saved.get('state', {}) if saved.get('version') in (4, 5, 6) else saved
     try:
         coins = order_coins(old.get('coins', []))
     except (ValueError, KeyError, TypeError):
         coins = []
     STATE.update(coins=coins, ct=old.get('ct', 0) if coins else 0,
                  fx=old.get('fx'), ft=old.get('ft', 0))
-    if saved.get('version') == 5:
+    if saved.get('version') == 6:
         SAVED.update(saved)
 
 
 def main():
+    from live_updates import LiveController
     global TOKEN
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     TOKEN = os.environ.get('BOT_TOKEN', '').strip()
@@ -291,28 +297,40 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Demand-only fixed watchlist; send /widget.', me.get('username'))
-    while True:
-        try:
-            params = {'timeout': 25, 'allowed_updates': ['message']}
-            if offset is not None:
-                params['offset'] = offset
-            for update in api('getUpdates', **params):
-                message, chat = update.get('message', {}), update.get('message', {}).get('chat', {})
-                if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
-                    words = message.get('text', '').split()
-                    command = words[0].split('@')[0] if words else ''
+    logging.info('Started @%s. Visible-widget refresh enabled.', me.get('username'))
+    with LiveController(sys.modules[__name__]) as live:
+        while True:
+            try:
+                params = {'timeout': 25, 'allowed_updates': ['message', 'widget_query', 'shared_widget_query']}
+                if offset is not None:
+                    params['offset'] = offset
+                updates = api('getUpdates', **params)
+                # Answer queries before scheduling commands from the same batch.
+                for update in updates:
                     try:
-                        if command in ('/widget', '/prices'):
-                            send_widget(chat['id'])
-                        elif command in ('/start', '/help'):
-                            api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены обновляются по запросу.')
+                        if 'widget_query' in update:
+                            live.handle_query(update['widget_query'], allowed)
+                        elif 'shared_widget_query' in update:
+                            live.handle_query(update['shared_widget_query'], allowed, shared=True)
                     except Exception as error:
-                        logging.error('Command: %s', error)
-                offset = update['update_id'] + 1
-        except Exception as error:
-            logging.warning('Polling: %s', error)
-            time.sleep(5)
+                        logging.warning('Query handling: %s', error)
+                for update in updates:
+                    message = update.get('message', {})
+                    chat = message.get('chat', {})
+                    if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
+                        words = message.get('text', '').split()
+                        command = words[0].split('@')[0] if words else ''
+                        try:
+                            if command in ('/widget', '/prices'):
+                                live.enqueue_send(chat['id'])
+                            elif command in ('/start', '/help'):
+                                api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены обновляются, пока виджет виден.')
+                        except Exception as error:
+                            logging.error('Command: %s', error)
+                    offset = update['update_id'] + 1
+            except Exception as error:
+                logging.warning('Polling: %s', error)
+                time.sleep(5)
 
 
 if __name__ == '__main__':
