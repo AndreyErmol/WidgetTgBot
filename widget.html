@@ -1,55 +1,13 @@
-<!doctype html>
-<html><head><meta charset="utf-8"><style>
-body{margin:0;padding:14px;font-family:system-ui;background:var(--tg-theme-bg-color);color:var(--tg-theme-text-color)}
-.head,.row,.foot{display:flex;align-items:center;justify-content:space-between}
-.head{margin-bottom:8px}h3{margin:0;font-size:19px}.sub,.foot{color:var(--tg-theme-hint-color);font-size:11px}
-.row{padding:12px 0;border-bottom:1px solid var(--tg-theme-section-separator-color)}
-.left{display:flex;align-items:center;gap:9px}.icon{width:30px;height:30px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-weight:bold;color:#fff;animation:turn 8s ease-in-out infinite}
-.btc{background:#bd700d}.eth{background:#7063ad;animation-delay:1.5s}.sol{background:#187c75;animation-delay:3s}.usd{background:#45678e;animation-delay:4.5s}
-@keyframes turn{0%,75%{transform:rotate(0deg)}95%,100%{transform:rotate(360deg)}}
-.name{font-size:14px;font-weight:bold}.sub{margin-top:3px}.right{text-align:right}.price{font-size:18px;font-weight:bold}.change{font-size:11px;margin-top:3px}
-.up{color:#228754}.down{color:#cf6269}.neutral{color:var(--tg-theme-hint-color)}
-.foot{margin-top:10px}#status{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--tg-theme-hint-color)}
-#lamp{display:inline-block;width:7px;height:7px;border-radius:4px;background:var(--tg-theme-hint-color)}
-#status.live{color:#228754}#status.live #lamp{background:#228754;animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
-@media(prefers-reduced-motion:reduce){.icon,#status.live #lamp{animation:none}}
-</style></head><body>
-<div class="head"><h3>Курсы</h3><span id="status"><span id="lamp"></span><span id="statusText">Загрузка</span></span></div>
-<div class="row"><div class="left"><span class="icon btc">B</span><div><div class="name">Bitcoin</div><div class="sub">BTC · Coinbase</div></div></div><div class="right"><div class="price" id="BTCp">—</div><div class="change neutral" id="BTCc">Нет данных</div></div></div>
-<div class="row"><div class="left"><span class="icon eth">E</span><div><div class="name">Ethereum</div><div class="sub">ETH · Coinbase</div></div></div><div class="right"><div class="price" id="ETHp">—</div><div class="change neutral" id="ETHc">Нет данных</div></div></div>
-<div class="row"><div class="left"><span class="icon sol">S</span><div><div class="name">Solana</div><div class="sub">SOL · Coinbase</div></div></div><div class="right"><div class="price" id="SOLp">—</div><div class="change neutral" id="SOLc">Нет данных</div></div></div>
-<div class="row"><div class="left"><span class="icon usd">$</span><div><div class="name">Доллар</div><div class="sub">USD/RUB · справочный</div></div></div><div class="right"><div class="price" id="USDp">—</div><div class="change neutral" id="USDc">Нет данных</div></div></div>
-<div class="foot"><span id="time">Ожидание источников</span></div>
-<script>
-const W=window.TelegramWidget;
-let state={r:0,q:{}};
-function text(id,value){document.getElementById(id).textContent=value;}
-function number(value){return Number(value).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,' ').replace('.',',');}
-function clock(t){const d=new Date(t*1000);return [d.getHours(),d.getMinutes(),d.getSeconds()].map(function(n){return ('0'+n).slice(-2);}).join(':');}
-function draw(){
- const now=Date.now()/1000;let fresh=true;let earliest=Infinity;
- ['BTC','ETH','SOL','USD'].forEach(function(s){
-  const q=state.q[s]||{};const valid=typeof q.p==='number'&&q.p>0;
-  const old=!valid||q.e||!q.t||now-q.t>30;fresh=fresh&&!old;
-  text(s+'p',valid?(s==='USD'?'₽ ':'$ ')+number(q.p):'—');
-  let label='Нет данных',color='neutral';
-  if(valid){
-   earliest=Math.min(earliest,q.t);
-   if(old){label='Устарело · '+clock(q.t);}
-   else if(s==='USD'){label='Получено '+clock(q.t);}
-   else if(typeof q.c==='number'){label=(q.c>=0?'+':'')+number(q.c)+'% за 24 ч';color=q.c>=0?'up':'down';}
-  }
-  text(s+'c',label);document.getElementById(s+'c').className='change '+color;
- });
- text('statusText',fresh?'LIVE':'Задержка / нет данных');
- const status=document.getElementById('status');const nextClass=fresh?'live':'';
- if(status.className!==nextClass){status.className=nextClass;}
- text('time',earliest<Infinity?'Получено от '+clock(earliest):'Ожидание источников');
-}
-function receive(){try{const next=JSON.parse(W.publicData||'null');if(next&&next.r>=state.r){state=next;}}catch(e){}draw();}
-W.onEvent('publicDataChanged',receive);
-W.watchPublicData();
-receive();
-setInterval(draw,1000);
-</script></body></html>
+<!doctype html><meta charset="utf-8"><style>
+body{margin:0;padding:0;font-family:system-ui;color:var(--tg-theme-text-color)}.wrap{padding:12px}.head,.row,.left,.nav,.foot{display:flex;align-items:center;justify-content:space-between}.head{gap:5px;margin-bottom:8px}.title{font-size:15px;font-weight:bold}.left{justify-content:flex-start;gap:8px;min-width:0}.row{height:53px;border-bottom:1px solid var(--tg-theme-section-separator-color)}b{font-size:14px}.right{text-align:right;flex-shrink:0}small{display:block;font-size:10px;color:var(--tg-theme-hint-color);margin-top:3px}.left b{display:block;max-width:150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.left img{flex-shrink:0}.nav{justify-content:center;gap:16px;margin:8px 0}.nav button{padding:3px 15px}.foot{font-size:11px;border-top:1px solid var(--tg-theme-section-separator-color);padding-top:8px}.time{font-size:10px;color:var(--tg-theme-hint-color);padding-top:6px;padding-bottom:max(12px,env(safe-area-inset-bottom));padding-right:max(12px,var(--tg-content-safe-area-corner-right))}.up{color:#228754}.down{color:#cf6269}#lamp{width:6px;height:6px;border-radius:3px;background:var(--tg-theme-hint-color)}#lamp.live{background:#228754;animation:pulse 2s infinite}#whale{animation:swim 3s ease-in-out infinite;flex-shrink:0}@keyframes pulse{50%{opacity:.35}}@keyframes swim{50%{transform:translateY(-2px) rotate(-5deg)}}@media(prefers-reduced-motion:reduce){#whale,#lamp.live{animation:none}}
+</style><div class="wrap"><div class="head"><div class="left"><svg id="whale" width="30" height="30" viewBox="0 0 40 40"><path fill="#21bce7" d="M8 17C5 10 1 13 3 19L1 24 9 24C11 39 33 39 36 22 40 5 17 3 12 17Z"/><path fill="#b5effa" d="M13 27Q26 34 35 23C31 38 17 37 13 27"/><path d="M17 21Q21 25 25 20" fill="none" stroke="#12536b" stroke-width="2" stroke-linecap="round"/><path fill="#21bce7" d="M23 8C15 3 20 0 23 6 27-2 31 3 25 8Z"/></svg><span class="title">CryptunaPriceWidget</span></div><span id="lamp"></span></div>
+__ROWS__
+<div class="nav"><button id="prev">‹</button><small id="page">1 / 2</small><button id="next">›</button></div><div class="foot"><span>USD/RUB · Coinbase</span><b id="fx">—</b></div><div class="time" id="time">—</div></div><script>
+const W=window.TelegramWidget,C=__COINS__;let S={r:0,q:[],t:0,f:[null,0]},page=0;
+function text(id,t){document.getElementById(id).textContent=t;}
+function num(n){return Number(n).toFixed(Number(n)<.01?6:2).replace(/\B(?=(\d{3})+(?!\d))/g,' ').replace('.',',');}
+function clock(t){const d=new Date(t*1000);return [d.getHours(),d.getMinutes(),d.getSeconds()].map(n=>('0'+n).slice(-2)).join(':');}
+function draw(){C.forEach(function(c,i){const q=S.q.find(q=>q[0]===c[0]);document.getElementById('row'+i).style.display=Math.floor(i/5)===page?'flex':'none';if(q){text('p'+i,'$ '+num(q[2]));text('c'+i,(q[3]>=0?'+':'')+num(q[3])+'% за 24 ч');document.getElementById('c'+i).className=q[3]>=0?'up':'down';text('sub'+i,'#'+q[1]+' · '+c[1]+(c[2]?' · закреплена':''));}});text('page',(page+1)+' / 2');document.getElementById('prev').disabled=page===0;document.getElementById('next').disabled=page===1;if(S.f[0])text('fx','₽ '+num(S.f[0]));text('time',S.t?'CMC · получено '+clock(S.t):'CMC');document.getElementById('lamp').className=S.t&&Date.now()/1000-S.t<45?'live':'';}
+document.getElementById('prev').onclick=function(){page=0;draw();};document.getElementById('next').onclick=function(){page=1;draw();};
+function receive(){try{const n=JSON.parse(W.publicData||'null');if(n&&n.r>=S.r)S=n;}catch(e){}draw();}W.onEvent('publicDataChanged',receive);W.watchPublicData();receive();setInterval(draw,1000);
+</script>
