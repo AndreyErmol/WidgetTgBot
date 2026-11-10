@@ -1,1 +1,1 @@
-Pillow>=10.0
+# No third-party dependencies.
