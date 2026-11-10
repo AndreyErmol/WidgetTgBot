@@ -2,21 +2,25 @@
 <html><head><meta charset="utf-8"><style>
 body{margin:0;padding:14px;font-family:system-ui;background:var(--tg-theme-bg-color);color:var(--tg-theme-text-color)}
 .head,.row,.foot{display:flex;align-items:center;justify-content:space-between}
-.head{margin-bottom:8px}h3{margin:0;font-size:19px}.hint,.sub,.foot{color:var(--tg-theme-hint-color);font-size:11px}
+.head{margin-bottom:8px}h3{margin:0;font-size:19px}.sub,.foot{color:var(--tg-theme-hint-color);font-size:11px}
 .row{padding:12px 0;border-bottom:1px solid var(--tg-theme-section-separator-color)}
-.left{display:flex;align-items:center;gap:9px}.icon{width:30px;height:30px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-weight:bold;color:#fff}
-.btc{background:#bd700d}.eth{background:#7063ad}.sol{background:#187c75}.usd{background:#45678e}
+.left{display:flex;align-items:center;gap:9px}.icon{width:30px;height:30px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-weight:bold;color:#fff;animation:turn 8s ease-in-out infinite}
+.btc{background:#bd700d}.eth{background:#7063ad;animation-delay:1.5s}.sol{background:#187c75;animation-delay:3s}.usd{background:#45678e;animation-delay:4.5s}
+@keyframes turn{0%,75%{transform:rotate(0deg)}95%,100%{transform:rotate(360deg)}}
 .name{font-size:14px;font-weight:bold}.sub{margin-top:3px}.right{text-align:right}.price{font-size:18px;font-weight:bold}.change{font-size:11px;margin-top:3px}
 .up{color:#228754}.down{color:#cf6269}.neutral{color:var(--tg-theme-hint-color)}
-.foot{margin-top:10px;align-items:flex-start;gap:8px}.note{font-size:10px;color:var(--tg-theme-hint-color);margin-top:8px}#status{font-size:10px;color:var(--tg-theme-hint-color)}
+.foot{margin-top:10px}#status{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--tg-theme-hint-color)}
+#lamp{display:inline-block;width:7px;height:7px;border-radius:4px;background:var(--tg-theme-hint-color)}
+#status.live{color:#228754}#status.live #lamp{background:#228754;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
+@media(prefers-reduced-motion:reduce){.icon,#status.live #lamp{animation:none}}
 </style></head><body>
-<div class="head"><h3>Курсы</h3><span id="status">Загрузка</span></div>
+<div class="head"><h3>Курсы</h3><span id="status"><span id="lamp"></span><span id="statusText">Загрузка</span></span></div>
 <div class="row"><div class="left"><span class="icon btc">B</span><div><div class="name">Bitcoin</div><div class="sub">BTC · Coinbase</div></div></div><div class="right"><div class="price" id="BTCp">—</div><div class="change neutral" id="BTCc">Нет данных</div></div></div>
 <div class="row"><div class="left"><span class="icon eth">E</span><div><div class="name">Ethereum</div><div class="sub">ETH · Coinbase</div></div></div><div class="right"><div class="price" id="ETHp">—</div><div class="change neutral" id="ETHc">Нет данных</div></div></div>
 <div class="row"><div class="left"><span class="icon sol">S</span><div><div class="name">Solana</div><div class="sub">SOL · Coinbase</div></div></div><div class="right"><div class="price" id="SOLp">—</div><div class="change neutral" id="SOLc">Нет данных</div></div></div>
 <div class="row"><div class="left"><span class="icon usd">$</span><div><div class="name">Доллар</div><div class="sub">USD/RUB · справочный</div></div></div><div class="right"><div class="price" id="USDp">—</div><div class="change neutral" id="USDc">Нет данных</div></div></div>
-<div class="foot"><span id="time">Ожидание источников</span><span>Опрос: 10 с</span></div>
-<div class="note">USD/RUB — Coinbase, не курс ЦБ или банка.<br>Время получения, не время сделки. Данные могут задерживаться.</div>
+<div class="foot"><span id="time">Ожидание источников</span></div>
 <script>
 const W=window.TelegramWidget;
 let state={r:0,q:{}};
@@ -38,7 +42,9 @@ function draw(){
   }
   text(s+'c',label);document.getElementById(s+'c').className='change '+color;
  });
- text('status',fresh?'● LIVE · опрос 10 с':'Задержка / нет данных');
+ text('statusText',fresh?'LIVE':'Задержка / нет данных');
+ const status=document.getElementById('status');const nextClass=fresh?'live':'';
+ if(status.className!==nextClass){status.className=nextClass;}
  text('time',earliest<Infinity?'Получено от '+clock(earliest):'Ожидание источников');
 }
 function receive(){try{const next=JSON.parse(W.publicData||'null');if(next&&next.r>=state.r){state=next;}}catch(e){}draw();}
