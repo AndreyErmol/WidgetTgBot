@@ -1,25 +1,49 @@
 <!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-body { font-family: system-ui; text-align: center; }
-h3 { margin: 8px 0; }
-#count { font-size: 36px; margin: 12px 0; }
-button { min-width: 120px; padding: 10px 24px; }
-</style>
-</head>
-<body>
-<h3>Счётчик нажатий</h3>
-<p id="count">0</p>
-<button id="increment">+1</button>
+<html><head><meta charset="utf-8"><style>
+body{margin:0;padding:14px;font-family:system-ui;background:var(--tg-theme-bg-color);color:var(--tg-theme-text-color)}
+.head,.row,.foot{display:flex;align-items:center;justify-content:space-between}
+.head{margin-bottom:8px}h3{margin:0;font-size:19px}.hint,.sub,.foot{color:var(--tg-theme-hint-color);font-size:11px}
+.row{padding:12px 0;border-bottom:1px solid var(--tg-theme-section-separator-color)}
+.left{display:flex;align-items:center;gap:9px}.icon{width:30px;height:30px;border-radius:15px;display:flex;align-items:center;justify-content:center;font-weight:bold;color:#fff}
+.btc{background:#bd700d}.eth{background:#7063ad}.sol{background:#187c75}.usd{background:#45678e}
+.name{font-size:14px;font-weight:bold}.sub{margin-top:3px}.right{text-align:right}.price{font-size:18px;font-weight:bold}.change{font-size:11px;margin-top:3px}
+.up{color:#228754}.down{color:#cf6269}.neutral{color:var(--tg-theme-hint-color)}
+.foot{margin-top:10px;align-items:flex-start;gap:8px}.note{font-size:10px;color:var(--tg-theme-hint-color);margin-top:8px}#status{font-size:10px;color:var(--tg-theme-hint-color)}
+</style></head><body>
+<div class="head"><h3>Курсы</h3><span id="status">Загрузка</span></div>
+<div class="row"><div class="left"><span class="icon btc">B</span><div><div class="name">Bitcoin</div><div class="sub">BTC · Coinbase</div></div></div><div class="right"><div class="price" id="BTCp">—</div><div class="change neutral" id="BTCc">Нет данных</div></div></div>
+<div class="row"><div class="left"><span class="icon eth">E</span><div><div class="name">Ethereum</div><div class="sub">ETH · Coinbase</div></div></div><div class="right"><div class="price" id="ETHp">—</div><div class="change neutral" id="ETHc">Нет данных</div></div></div>
+<div class="row"><div class="left"><span class="icon sol">S</span><div><div class="name">Solana</div><div class="sub">SOL · Coinbase</div></div></div><div class="right"><div class="price" id="SOLp">—</div><div class="change neutral" id="SOLc">Нет данных</div></div></div>
+<div class="row"><div class="left"><span class="icon usd">$</span><div><div class="name">Доллар</div><div class="sub">USD/RUB · справочный</div></div></div><div class="right"><div class="price" id="USDp">—</div><div class="change neutral" id="USDc">Нет данных</div></div></div>
+<div class="foot"><span id="time">Ожидание источников</span><span>Опрос: 10 с</span></div>
+<div class="note">USD/RUB — Coinbase, не курс ЦБ или банка.<br>Время получения, не время сделки. Данные могут задерживаться.</div>
 <script>
-let count = 0;
-const output = document.getElementById('count');
-document.getElementById('increment').addEventListener('click', function () {
-  count += 1;
-  output.textContent = String(count);
-});
-</script>
-</body>
-</html>
+const W=window.TelegramWidget;
+let state={r:0,q:{}};
+function text(id,value){document.getElementById(id).textContent=value;}
+function number(value){return Number(value).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,' ').replace('.',',');}
+function clock(t){const d=new Date(t*1000);return [d.getHours(),d.getMinutes(),d.getSeconds()].map(function(n){return ('0'+n).slice(-2);}).join(':');}
+function draw(){
+ const now=Date.now()/1000;let fresh=true;let earliest=Infinity;
+ ['BTC','ETH','SOL','USD'].forEach(function(s){
+  const q=state.q[s]||{};const valid=typeof q.p==='number'&&q.p>0;
+  const old=!valid||q.e||!q.t||now-q.t>30;fresh=fresh&&!old;
+  text(s+'p',valid?(s==='USD'?'₽ ':'$ ')+number(q.p):'—');
+  let label='Нет данных',color='neutral';
+  if(valid){
+   earliest=Math.min(earliest,q.t);
+   if(old){label='Устарело · '+clock(q.t);}
+   else if(s==='USD'){label='Получено '+clock(q.t);}
+   else if(typeof q.c==='number'){label=(q.c>=0?'+':'')+number(q.c)+'% за 24 ч';color=q.c>=0?'up':'down';}
+  }
+  text(s+'c',label);document.getElementById(s+'c').className='change '+color;
+ });
+ text('status',fresh?'● LIVE · опрос 10 с':'Задержка / нет данных');
+ text('time',earliest<Infinity?'Получено от '+clock(earliest):'Ожидание источников');
+}
+function receive(){try{const next=JSON.parse(W.publicData||'null');if(next&&next.r>=state.r){state=next;}}catch(e){}draw();}
+W.onEvent('publicDataChanged',receive);
+W.watchPublicData();
+receive();
+setInterval(draw,1000);
+</script></body></html>
