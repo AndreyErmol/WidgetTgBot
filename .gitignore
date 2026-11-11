@@ -7,3 +7,10 @@ __pycache__/
 .DS_Store
 runtime.json
 runtime.json.tmp
+*.sqlite*
+*.db
+*.db-*
+*-wal
+*-shm
+*-journal
+data/

@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 BASE = Path(__file__).resolve().parent
+DATA_DIR = Path('/data')
 ASSETS = (('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('BNB', 'bnb'), ('XRP', 'xrp'),
           ('SUI', 'sui'), ('SOL', 'solana'), ('TRX', 'tron'), ('HYPE', 'hyperliquid'),
           ('ZEC', 'zcash'), ('DOGE', 'dogecoin'))
@@ -213,9 +214,9 @@ def pack():
 def persist():
     with LOCK:
         data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=6)
-        tmp = BASE / 'runtime.json.tmp'
+        tmp = DATA_DIR / 'runtime.json.tmp'
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-        tmp.replace(BASE / 'runtime.json')
+        tmp.replace(DATA_DIR / 'runtime.json')
 
 
 def refresh_on_demand():
@@ -284,20 +285,25 @@ def restore(saved):
 
 def main():
     from live_updates import LiveController
+    from widget_stats import WidgetStats, record_widget_request
     global TOKEN
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     TOKEN = os.environ.get('BOT_TOKEN', '').strip()
     if not TOKEN:
         raise SystemExit('Set BOT_TOKEN.')
     allowed = int(os.environ.get('ALLOWED_USER_ID', '0'))
-    path = BASE / 'runtime.json'
+    stats = WidgetStats()
+    path = DATA_DIR / 'runtime.json'
+    if not path.exists():
+        path = BASE / 'runtime.json'
     if path.exists():
         restore(json.loads(path.read_text(encoding='utf-8')))
+    persist()
     me = api('getMe')
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Visible-widget refresh enabled.', me.get('username'))
+    logging.info('Started @%s. Visible-widget refresh enabled; SQLite stats in /data.', me.get('username'))
     with LiveController(sys.modules[__name__]) as live:
         while True:
             try:
@@ -315,6 +321,9 @@ def main():
                     except Exception as error:
                         logging.warning('Query handling: %s', error)
                 for update in updates:
+                    # Commit the audit event before processing or acknowledging its update.
+                    # DB failures reach the polling retry without advancing this update's offset.
+                    record_widget_request(stats, me['id'], update)
                     message = update.get('message', {})
                     chat = message.get('chat', {})
                     if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
