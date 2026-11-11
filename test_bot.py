@@ -1,111 +1,131 @@
 import json
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 import bot
+from market_data import ASSETS, SOURCE, MarketData, Slot
 
 
-def coins():
-    return [{'id': i+1, 'symbol': symbol, 'slug': slug, 'name': symbol,
-             'rank': i+1, 'p': 1.25, 'c': -2.19} for i,(symbol,slug) in enumerate(bot.ASSETS)]
-
-
-def response():
-    return {'data': [dict(c, cmc_rank=c['rank'], quote={'USD': {'price': c['p'],
-                     'percent_change_24h': c['c']}}) for c in coins()]}
+def response(url):
+    if 'coinbase.com' in url:
+        return {'data':{'currency':'USD','rates':{'RUB':'83.17'}}}
+    pair=parse_qs(urlparse(url).query)['symbol'][0]
+    return {'retCode':0,'result':{'category':'spot','list':[{'symbol':pair,'lastPrice':'1.25','price24hPcnt':'-0.0219'}]}}
 
 
 class Tests(unittest.TestCase):
-    def test_exact_order(self):
-        result=bot.order_coins(list(reversed(coins())))
-        self.assertEqual([c['symbol'] for c in result],['BTC','ETH','BNB','XRP','SUI','SOL','TRX','HYPE','ZEC','DOGE'])
+    def setUp(self):
+        self.request=Mock(side_effect=response)
+        self.market=MarketData(self.request)
 
-    def test_missing_asset_rejected(self):
-        with self.assertRaises(ValueError):
-            bot.order_coins(coins()[:-1])
+    def test_exact_pairs_and_order(self):
+        coins,stamp=self.market.coins()
+        self.assertEqual([c['symbol'] for c in coins],['BTC','ETH','BNB','XRP','SUI','SOL','TRX','HYPE','ZEC','DOGE'])
+        self.assertEqual(self.request.call_count,10)
+        pairs=[]
+        for call in self.request.call_args_list:
+            url=call.args[0]; q=parse_qs(urlparse(url).query)
+            self.assertEqual(urlparse(url).netloc,'api.bybit.com')
+            self.assertEqual(q['category'],['spot']); pairs+=q['symbol']
+        self.assertEqual(set(pairs),{s+'USDT' for s,_ in ASSETS})
+        self.assertTrue(stamp); self.assertAlmostEqual(coins[0]['c'],-2.19)
 
-    def test_wrong_symbol_rejected(self):
-        data=coins(); data[0]['symbol']='OTHER'
-        with self.assertRaises(ValueError):
-            bot.order_coins(data)
+    def test_cache_shared_by_callers(self):
+        first=self.market.coins();second=self.market.coins()
+        self.assertEqual(first,second);self.assertEqual(self.request.call_count,10)
 
-    def test_one_quotes_request_for_ten(self):
-        with patch.object(bot,'CMC_LIMIT',bot.RateLimiter()), patch.object(bot,'CMC_CACHE',bot.Cache()), patch('bot.json_request',return_value=response()) as request:
-            first=bot.fetch_coins(); second=bot.fetch_coins()
-        self.assertEqual(request.call_count,1)
-        self.assertEqual(first,second)
-        url=request.call_args.args[0]
-        self.assertIn('/v3/cryptocurrency/quotes/latest?',url)
-        query=parse_qs(urlparse(url).query)
-        self.assertEqual(query['slug'][0].split(','),[slug for _,slug in bot.ASSETS])
-        self.assertNotIn('listings',url)
+    def test_concurrent_singleflight(self):
+        with ThreadPoolExecutor(max_workers=3) as pool:list(pool.map(lambda _:self.market.coins(),range(3)))
+        self.assertEqual(self.request.call_count,10)
 
-    def test_limit_boundary(self):
-        now=[0.0]; limiter=bot.RateLimiter(clock=lambda:now[0])
-        self.assertTrue(all(limiter.reserve() for _ in range(50)))
-        self.assertFalse(limiter.reserve())
-        now[0]=59.999; self.assertFalse(limiter.reserve())
-        now[0]=60; self.assertTrue(limiter.reserve())
+    def test_partial_failure_keeps_timestamp(self):
+        first,_=self.market.coins()
+        for slot in self.market.slots.values():slot.fresh=0
+        def flaky(url):
+            if 'symbol=BTCUSDT' in url:raise bot.APIError('offline')
+            return response(url)
+        self.request.side_effect=flaky
+        second,_=self.market.coins()
+        self.assertEqual(first[0],second[0])
+        self.assertEqual(second[-1]['p'],1.25)
 
-    def test_concurrent_limit(self):
-        limiter=bot.RateLimiter(clock=lambda:0)
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            results=list(pool.map(lambda _:limiter.reserve(),range(200)))
-        self.assertEqual(sum(results),50)
+    def test_missing_pair_is_not_futures_or_zero(self):
+        self.request.return_value=None
+        self.request.side_effect=lambda url:{'retCode':0,'result':{'category':'spot','list':[]}}
+        coins,stamp=self.market.coins()
+        self.assertIsNone(coins[0]['p']);self.assertEqual(stamp,0)
+        self.assertEqual(self.request.call_count,10)
 
-    def test_failure_consumes_slot(self):
-        limiter=bot.RateLimiter(limit=1)
-        with patch.object(bot,'CMC_LIMIT',limiter), patch.object(bot,'CMC_CACHE',bot.Cache()), patch('bot.json_request',side_effect=bot.APIError('offline')):
-            with self.assertRaises(bot.APIError): bot.fetch_coins()
-        self.assertFalse(limiter.reserve())
+    def test_wrong_pair_and_nonfinite_rejected(self):
+        for field,value in [('symbol','BTCUSD'),('lastPrice','NaN'),('lastPrice','0'),('price24hPcnt','inf')]:
+            def bad(url):
+                result=response(url);result['result']['list'][0][field]=value;return result
+            market=MarketData(bad)
+            self.assertIsNone(market.quote(ASSETS[0])[0])
 
-    def test_cooldown_keeps_timestamp(self):
-        cache=bot.Cache(); loader=Mock(return_value=coins())
-        old=cache.get('q',loader,ttl=0)
-        loader.side_effect=bot.APIError('429',True,120)
-        with self.assertRaises(bot.APIError): cache.get('q',loader)
-        self.assertEqual(cache.get('q',loader),old)
-        self.assertEqual(loader.call_count,2)
+    def test_error_cooldown_silent(self):
+        slot=Slot('test');loader=Mock(side_effect=bot.APIError('429',True,120))
+        with patch('market_data.logging.warning') as warning:
+            self.assertEqual(slot.get(loader,10),(None,0))
+            for _ in range(10):slot.get(loader,10)
+        self.assertEqual(loader.call_count,1);self.assertEqual(warning.call_count,1)
+
+    def test_global_rate_limit_and_pause(self):
+        self.assertTrue(all(self.market.permit() for _ in range(60)))
+        self.assertFalse(self.market.permit())
+        market=MarketData(self.request);market.failed(bot.APIError('429',True,120))
+        self.assertFalse(market.permit())
+        market=MarketData(self.request);market.failed(bot.APIError('HTTP 403'))
+        self.assertFalse(market.permit())
+
+    def test_bybit_business_limit(self):
+        self.request.side_effect=lambda url:{'retCode':10006,'retMsg':'too many'}
+        self.assertIsNone(self.market.quote(ASSETS[0])[0]);self.assertFalse(self.market.permit())
+
+    def test_fx_independent_cache(self):
+        self.assertEqual(self.market.rate()[0],83.17)
+        self.market.rate();self.assertEqual(self.request.call_count,1)
+        self.assertEqual(self.request.call_args.args[0],'https://api.coinbase.com/v2/exchange-rates?currency=USD')
 
     def test_recent_no_fetch(self):
-        with patch.dict(bot.STATE,coins=coins(),ct=100,fx=83.17,ft=100), patch('bot.time.time',return_value=105), patch('bot.fetch_coins') as fetch, patch('bot.json_request') as request:
+        with patch.dict(bot.STATE,coins=[{}],ct=100,fx=83.17,ft=100),patch('bot.time.time',return_value=105),patch('bot.fetch_coins') as fetch,patch.object(bot.MARKET,'rate') as rate:
             bot.refresh_on_demand()
-        fetch.assert_not_called(); request.assert_not_called()
+        fetch.assert_not_called();rate.assert_not_called()
 
-    def test_stale_refresh(self):
-        with patch.dict(bot.STATE,coins=coins(),ct=10,fx=83.17,ft=100), patch('bot.time.time',return_value=100), patch('bot.fetch_coins',return_value=(coins(),100)) as fetch:
-            bot.refresh_on_demand(); self.assertEqual(bot.STATE['ct'],100)
-        fetch.assert_called_once()
+    def test_restored_bybit_data_does_not_refetch_when_fresh(self):
+        coins,stamp=self.market.coins()
+        market=MarketData(self.request);market.seed(coins,83.17,stamp)
+        self.request.reset_mock();market.coins();market.rate();self.request.assert_not_called()
 
-    def test_error_fallback(self):
-        with patch.dict(bot.STATE,coins=coins(),ct=10,fx=83.17,ft=100), patch('bot.time.time',return_value=100), patch('bot.fetch_coins',side_effect=bot.APIError('429',True,120)):
-            before=bot.STATE['coins']; bot.refresh_on_demand()
-            self.assertEqual(bot.STATE['coins'],before); self.assertEqual(bot.STATE['ct'],10)
+    def test_legacy_dollar_prices_never_restored_as_usdt(self):
+        with patch.object(bot,'MARKET',self.market),patch.object(bot,'TOKEN','1:secret'),patch.dict(bot.STATE,{},clear=True),patch.dict(bot.SAVED,{},clear=True):
+            bot.restore({'bot':'1','version':6,'widget_id':'old','state':{'coins':[{'symbol':'BTC','p':100,'c':1,'t':int(time.time())}],'fx':83.17,'ft':int(time.time())}})
+            self.assertTrue(all(c['p'] is None for c in bot.STATE['coins']))
+            self.assertEqual(bot.STATE['fx'],83.17);self.assertNotIn('widget_id',bot.SAVED)
+        self.request.assert_not_called()
 
-    def test_twenty_commands_use_cache(self):
-        with patch.dict(bot.STATE,coins=coins(),ct=100,fx=83.17,ft=100), patch.dict(bot.SAVED,{},clear=True), patch('bot.time.time',return_value=105), patch('bot.fetch_coins') as fetch, patch('bot.json_request') as request, patch('bot.Path.read_text',return_value='<b>widget</b>'), patch('bot.persist'), patch('bot.api',return_value={'widget':{'id':'test'}}) as api:
-            for i in range(20): bot.send_widget(i)
-        fetch.assert_not_called(); request.assert_not_called()
-        self.assertEqual(sum(c.args[0]=='sendWidget' for c in api.call_args_list),1)
-        self.assertEqual(sum(c.args[0]=='sendSharedWidget' for c in api.call_args_list),19)
+    def test_new_runtime_restores_source(self):
+        coins,stamp=self.market.coins()
+        fresh=MarketData(self.request)
+        with patch.object(bot,'MARKET',fresh),patch.object(bot,'TOKEN','1:secret'),patch.dict(bot.STATE,{},clear=True),patch.dict(bot.SAVED,{},clear=True):
+            bot.restore({'bot':'1','version':7,'quote_source':SOURCE,'widget_id':'new','state':{'coins':coins,'fx':83.17,'ft':stamp}})
+            self.assertEqual(bot.STATE['coins'][0]['p'],1.25);self.assertEqual(bot.SAVED['widget_id'],'new')
 
-    def test_restore_reorders_fixed_watchlist(self):
-        with patch.object(bot,'TOKEN','test:secret'), patch.dict(bot.STATE,{},clear=True), patch.dict(bot.SAVED,{},clear=True):
-            bot.restore({'bot':'test','version':4,'state':{'coins':list(reversed(coins())),'ct':100}})
-            self.assertEqual([c['symbol'] for c in bot.STATE['coins']],[s for s,_ in bot.ASSETS])
-
-    def test_format_and_size(self):
+    def test_format_and_payload_size_with_missing_data(self):
         self.assertEqual(bot.format_percent(-2.19),'-2,19%')
         self.assertEqual(bot.format_price(73057.95),'73 057,95')
-        with patch.dict(bot.STATE,coins=coins(),fx=83.17):
-            state=bot.pack()
+        coins,stamp=self.market.coins();coins[-1].update(p=None,c=None,t=0)
+        with patch.dict(bot.STATE,coins=coins,ct=stamp,fx=83.17,ft=stamp):state=bot.pack()
         self.assertLessEqual(len(state.encode()),1024)
         self.assertEqual(json.loads(state)['q'][0][5],'-2,19%')
+        self.assertIsNone(json.loads(state)['q'][-1][4]);self.assertEqual(json.loads(state)['ft'],stamp)
 
-    def test_no_background_worker(self):
+    def test_idle_and_restore_do_not_request(self):
+        fresh=MarketData(self.request);fresh.seed([]);fresh.cached()
+        self.request.assert_not_called()
         self.assertFalse(hasattr(bot,'source_loop'))
 
 
-if __name__=='__main__':
-    unittest.main()
+if __name__=='__main__':unittest.main()

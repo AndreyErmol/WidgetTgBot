@@ -3,24 +3,19 @@ import json
 import logging
 import math
 import os
-import random
 import sys
 import threading
 import time
 import zlib
-from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from market_data import ASSETS, SOURCE, MarketData
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = Path('/data')
-ASSETS = (('BTC', 'bitcoin'), ('ETH', 'ethereum'), ('BNB', 'bnb'), ('XRP', 'xrp'),
-          ('SUI', 'sui'), ('SOL', 'solana'), ('TRX', 'tron'), ('HYPE', 'hyperliquid'),
-          ('ZEC', 'zcash'), ('DOGE', 'dogecoin'))
 TOKEN = ''
 LOCK = threading.RLock()
 SEND_LOCK = threading.Lock()
@@ -32,22 +27,6 @@ class APIError(Exception):
     def __init__(self, message, limited=False, retry=0):
         super().__init__(message)
         self.limited, self.retry = limited, retry
-
-
-class RateLimiter:
-    def __init__(self, limit=50, period=60, clock=time.monotonic):
-        self.limit, self.period, self.clock = limit, period, clock
-        self.lock, self.attempts = threading.Lock(), deque()
-
-    def reserve(self):
-        with self.lock:
-            now = self.clock()
-            while self.attempts and self.attempts[0] <= now - self.period:
-                self.attempts.popleft()
-            if len(self.attempts) >= self.limit:
-                return False
-            self.attempts.append(now)
-            return True
 
 
 def retry_seconds(value):
@@ -62,7 +41,7 @@ def retry_seconds(value):
 
 def json_request(url, params=None, timeout=None):
     body = None if params is None else json.dumps(params).encode()
-    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/6',
+    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/7',
                                               'Content-Type': 'application/json'})
     try:
         seconds = timeout if timeout is not None else (40 if params is not None else 8)
@@ -83,35 +62,7 @@ def json_request(url, params=None, timeout=None):
         raise APIError(detail) from None
 
 
-class Cache:
-    def __init__(self):
-        self.lock, self.values = threading.Lock(), {}
-        self.until, self.failures = 0, 0
-
-    def get(self, key, loader, ttl=10):
-        with self.lock:
-            now, old = time.monotonic(), self.values.get(key)
-            if old and (now < old[2] or now < self.until):
-                return old[:2]
-            if now < self.until:
-                raise APIError('Provider cooldown')
-            try:
-                data = loader()
-            except Exception as error:
-                self.failures += 1
-                delay = min(900, 5 * 2 ** min(self.failures - 1, 8))
-                if isinstance(error, APIError) and error.limited:
-                    delay = max(60, delay, error.retry)
-                self.until = time.monotonic() + delay + random.uniform(0, 1)
-                raise
-            self.failures, self.until = 0, 0
-            entry = (data, int(time.time()), time.monotonic() + ttl)
-            self.values[key] = entry
-            return entry[:2]
-
-
-CMC_CACHE, FX_CACHE = Cache(), Cache()
-CMC_LIMIT = RateLimiter()
+MARKET = MarketData(lambda url: json_request(url))
 TG_UNTIL = 0
 TG_LOCK = threading.Lock()
 
@@ -143,45 +94,8 @@ def finite(value, positive=False):
     return number
 
 
-def records(data):
-    if isinstance(data, list):
-        return data
-    return [item for value in data.values() for item in (value if isinstance(value, list) else [value])]
-
-
-def coin(item):
-    quotes = item['quote']
-    usd = next(q for q in quotes if q.get('symbol') == 'USD') if isinstance(quotes, list) else quotes['USD']
-    return {'id': int(item['id']), 'name': str(item['name']), 'symbol': str(item['symbol']),
-            'slug': item.get('slug', ''), 'rank': int(item['cmc_rank']),
-            'p': finite(usd['price'], True), 'c': finite(usd['percent_change_24h'])}
-
-
-def order_coins(items):
-    by_slug = {c.get('slug'): c for c in items}
-    ordered = []
-    for symbol, slug in ASSETS:
-        c = by_slug.get(slug)
-        if c is None or c['symbol'].upper() != symbol:
-            raise ValueError(f'Missing or mismatched quote: {symbol}/{slug}')
-        ordered.append(c)
-    return ordered
-
-
 def fetch_coins():
-    params = {'slug': ','.join(slug for _, slug in ASSETS), 'convert': 'USD'}
-    key = 'v3/cryptocurrency/quotes/latest?' + urlencode(params)
-    def load():
-        if not CMC_LIMIT.reserve():
-            raise APIError('Local CMC limit: 50 attempts per rolling 60 seconds')
-        response = json_request('https://pro-api.coinmarketcap.com/public-api/' + key)
-        status = response.get('status', {})
-        code = int(status.get('error_code') or 0)
-        if code:
-            raise APIError(str(status.get('error_message', 'CMC error')),
-                           code in (429, 1008, 1009, 1010), 60)
-        return order_coins(list(map(coin, records(response['data']))))
-    return CMC_CACHE.get(key, load, ttl=10)
+    return MARKET.coins()
 
 
 def format_price(value):
@@ -202,9 +116,11 @@ def pack():
         snapshot, coins = dict(STATE), [dict(c) for c in STATE['coins']]
     for size in (20, 12, 6, 0):
         rows = [[c['id'], c['name'][:size], c['symbol'], c['rank'],
-                 format_price(c['p']), format_percent(c['c']), int(c['c'] >= 0)] for c in coins]
+                 format_price(c['p']) if c['p'] is not None else None,
+                 format_percent(c['c']) if c['c'] is not None else None,
+                 int(c['c'] >= 0) if c['c'] is not None else None, c.get('t',0)] for c in coins]
         state = {'r': time.time_ns() // 1000, 't': snapshot['ct'], 'q': rows,
-                 'f': format_price(snapshot['fx']) if snapshot['fx'] else None}
+                 'f': format_price(snapshot['fx']) if snapshot['fx'] else None, 'ft':snapshot['ft']}
         text = json.dumps(state, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
         if len(text.encode()) <= 1024:
             return text
@@ -213,7 +129,7 @@ def pack():
 
 def persist():
     with LOCK:
-        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=6)
+        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=7, quote_source=SOURCE)
         tmp = DATA_DIR / 'runtime.json.tmp'
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         tmp.replace(DATA_DIR / 'runtime.json')
@@ -226,19 +142,11 @@ def refresh_on_demand():
             with LOCK:
                 STATE.update(coins=coins, ct=stamp)
         except Exception as error:
-            logging.warning('CMC: %s; serving local prices', error)
+            logging.warning('Bybit snapshot: %s; keeping previous prices',error)
     if STATE['fx'] is None or time.time() - STATE['ft'] >= 60:
-        try:
-            def load_fx():
-                data = json_request('https://api.coinbase.com/v2/exchange-rates?currency=USD')['data']
-                if data['currency'] != 'USD':
-                    raise ValueError('Wrong FX currency')
-                return finite(data['rates']['RUB'], True)
-            rate, stamp = FX_CACHE.get('USD/RUB', load_fx, ttl=60)
-            with LOCK:
-                STATE.update(fx=rate, ft=stamp)
-        except Exception as error:
-            logging.warning('Coinbase: %s; serving local rate', error)
+        rate,stamp = MARKET.rate()
+        with LOCK:
+            STATE.update(fx=rate,ft=stamp)
 
 
 def send_widget(chat_id):
@@ -272,14 +180,12 @@ def send_widget(chat_id):
 def restore(saved):
     if saved.get('bot') != TOKEN.split(':')[0]:
         return
-    old = saved.get('state', {}) if saved.get('version') in (4, 5, 6) else saved
-    try:
-        coins = order_coins(old.get('coins', []))
-    except (ValueError, KeyError, TypeError):
-        coins = []
-    STATE.update(coins=coins, ct=old.get('ct', 0) if coins else 0,
-                 fx=old.get('fx'), ft=old.get('ft', 0))
-    if saved.get('version') == 6:
+    old = saved.get('state', {}) if saved.get('version') in (4,5,6,7) else saved
+    compatible = saved.get('version') == 7 and saved.get('quote_source') == SOURCE
+    MARKET.seed(old.get('coins',[]) if compatible else [],old.get('fx'),old.get('ft',0))
+    coins,stamp = MARKET.cached()
+    STATE.update(coins=coins,ct=stamp,fx=MARKET.fx.data,ft=MARKET.fx.stamp)
+    if compatible:
         SAVED.update(saved)
 
 
@@ -304,7 +210,7 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Visible widgets and admin statistics enabled.', me.get('username'))
+    logging.info('Started @%s. Bybit Spot/USDT, Coinbase USD/RUB and admin statistics.', me.get('username'))
     with LiveController(sys.modules[__name__]) as live, AdminPanel(sys.modules[__name__], stats.path) as admin:
         while True:
             try:
@@ -340,7 +246,7 @@ def main():
                             if command in ('/widget', '/prices'):
                                 live.enqueue_send(chat['id'])
                             elif command in ('/start', '/help'):
-                                api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены обновляются, пока виджет виден.')
+                                api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены Bybit Spot в USDT обновляются, пока виджет виден.')
                         except Exception as error:
                             logging.error('Command: %s', error)
                     offset = update['update_id'] + 1
