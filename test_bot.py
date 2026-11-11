@@ -22,7 +22,7 @@ class Tests(unittest.TestCase):
 
     def test_exact_pairs_and_order(self):
         coins,stamp=self.market.coins()
-        self.assertEqual([c['symbol'] for c in coins],['BTC','ETH','BNB','XRP','SUI','SOL','TRX','HYPE','ZEC','DOGE'])
+        self.assertEqual([c['symbol'] for c in coins],['BTC','ETH','BNB','XRP','SUI','SOL','TRX','HYPE','GRAM','DOGE'])
         self.assertEqual(self.request.call_count,10)
         pairs=[]
         for call in self.request.call_args_list:

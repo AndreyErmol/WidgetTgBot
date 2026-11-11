@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 SOURCE = 'bybit_spot_usdt'
 ASSETS = (('BTC','Bitcoin'),('ETH','Ethereum'),('BNB','BNB'),('XRP','XRP'),
           ('SUI','Sui'),('SOL','Solana'),('TRX','TRON'),('HYPE','Hyperliquid'),
-          ('ZEC','Zcash'),('DOGE','Dogecoin'))
+          ('GRAM','Gram'),('DOGE','Dogecoin'))
 
 
 def number(value, positive=False):
