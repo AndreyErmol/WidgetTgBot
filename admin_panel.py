@@ -118,7 +118,41 @@ class AdminPanel:
         self.reply(uid, 'Статистика будет приходить ежедневно в '+args[0]+' МСК.')
         logging.info('Notification configured user=%s time=%s MSK', uid, args[0])
 
+    @staticmethod
+    def notification_count(c):
+        try:
+            return c.execute('SELECT COUNT(*) FROM price_notifications').fetchone()[0]
+        except sqlite3.OperationalError as error:
+            if 'no such table' not in str(error):
+                raise
+            return 0
+
+    def notification_snapshot(self, uid, offset=0):
+        with self.db() as c:
+            c.execute('BEGIN')
+            if uid not in self.admins(c):
+                return None
+            total = self.notification_count(c)
+            offset = min(offset, max(0, total-1))
+            records = []
+            if total:
+                records = c.execute(
+                    'SELECT n.user_id,'
+                    '(SELECT w.username FROM widget_requests w WHERE w.user_id=n.user_id '
+                    'ORDER BY w.update_id DESC LIMIT 1),n.minute '
+                    'FROM price_notifications n ORDER BY n.minute,n.user_id LIMIT 5 OFFSET ?', (offset,)).fetchall()
+        rows = [[i, n[:32] if n else None, f'{m//60:02d}:{m%60:02d}'] for i, n, m in records]
+        data = {'day':2, 'date':'Сортировка по времени отправки', 'users':total, 'calls':total,
+                'nt':total, 'offset':offset, 'rows':rows}
+        while len(json.dumps(data, ensure_ascii=False).encode()) > 1024 and rows:
+            rows.pop()
+        if total and not rows:
+            raise ValueError('Notification state exceeds Telegram limit')
+        return data
+
     def snapshot(self, uid, anchor, day=0, offset=0):
+        if day == 2:
+            return self.notification_snapshot(uid, offset)
         start = datetime.strptime(anchor, '%Y-%m-%d').replace(tzinfo=MSK) - timedelta(days=day)
         bounds = [d.astimezone(timezone.utc).isoformat(timespec='seconds') for d in (start, start+timedelta(days=1))]
         with self.db() as c:
@@ -130,11 +164,12 @@ class AdminPanel:
             where = f'requested_at>=? AND requested_at<? AND user_id NOT IN ({marks})'
             params = (*bounds, *sorted(admins))
             calls, users = c.execute('SELECT COUNT(*),COUNT(DISTINCT user_id) FROM widget_requests WHERE '+where, params).fetchone()
+            enabled = self.notification_count(c)
             offset = min(offset, max(0, calls-1))
             records = c.execute('SELECT user_id,username,requested_at FROM widget_requests WHERE '+where+
                                 ' ORDER BY requested_at DESC,update_id DESC LIMIT 5 OFFSET ?', (*params, offset)).fetchall()
         rows = [[i, n[:32] if n else None, datetime.fromisoformat(t).astimezone(MSK).strftime('%H:%M:%S')] for i,n,t in records]
-        data = {'day':day, 'date':start.strftime('%d.%m.%Y'), 'users':users, 'calls':calls, 'offset':offset, 'rows':rows}
+        data = {'day':day, 'date':start.strftime('%d.%m.%Y'), 'users':users, 'calls':calls, 'nt':enabled, 'offset':offset, 'rows':rows}
         while len(json.dumps(data, ensure_ascii=False).encode()) > 1024 and rows:
             rows.pop()
         if calls and not rows:
@@ -169,7 +204,7 @@ class AdminPanel:
         params = {'widget_query_id':query['id']}
         uid = query.get('from', {}).get('id')
         chat = query.get('chat', {})
-        match = re.fullmatch(r'stats:([01]):([0-9]{1,10})', text)
+        match = re.fullmatch(r'stats:([012]):([0-9]{1,10})', text)
         try:
             if not shared and match and chat.get('type') == 'private' and chat.get('id') == uid:
                 with self.db() as c:
