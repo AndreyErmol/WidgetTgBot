@@ -284,6 +284,7 @@ def restore(saved):
 
 
 def main():
+    from admin_panel import AdminPanel
     from live_updates import LiveController
     from widget_stats import WidgetStats, record_widget_request
     global TOKEN
@@ -303,32 +304,38 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Visible-widget refresh enabled; SQLite stats in /data.', me.get('username'))
-    with LiveController(sys.modules[__name__]) as live:
+    logging.info('Started @%s. Visible widgets and admin statistics enabled.', me.get('username'))
+    with LiveController(sys.modules[__name__]) as live, AdminPanel(sys.modules[__name__], stats.path) as admin:
         while True:
             try:
                 params = {'timeout': 25, 'allowed_updates': ['message', 'widget_query', 'shared_widget_query']}
                 if offset is not None:
                     params['offset'] = offset
                 updates = api('getUpdates', **params)
-                # Answer queries before scheduling commands from the same batch.
                 for update in updates:
                     try:
                         if 'widget_query' in update:
-                            live.handle_query(update['widget_query'], allowed)
+                            query = update['widget_query']
+                            if not admin.handle_query(query):
+                                live.handle_query(query, allowed)
                         elif 'shared_widget_query' in update:
-                            live.handle_query(update['shared_widget_query'], allowed, shared=True)
+                            query = update['shared_widget_query']
+                            if not admin.handle_query(query, shared=True):
+                                live.handle_query(query, allowed, shared=True)
                     except Exception as error:
                         logging.warning('Query handling: %s', error)
                 for update in updates:
-                    # Commit the audit event before processing or acknowledging its update.
-                    # DB failures reach the polling retry without advancing this update's offset.
                     record_widget_request(stats, me['id'], update)
                     message = update.get('message', {})
                     chat = message.get('chat', {})
-                    if chat.get('type') == 'private' and (not allowed or message.get('from', {}).get('id') == allowed):
-                        words = message.get('text', '').split()
-                        command = words[0].split('@')[0] if words else ''
+                    words = message.get('text', '').split()
+                    command = words[0].split('@')[0] if words else ''
+                    user_id = message.get('from', {}).get('id')
+                    if command in ('/widget', '/prices', '/start', '/help', '/statistic', '/notification'):
+                        logging.info('Command update=%s user=%s command=%s', update['update_id'], user_id, command)
+                    if admin.handle_message(message):
+                        pass
+                    elif chat.get('type') == 'private' and (not allowed or user_id == allowed):
                         try:
                             if command in ('/widget', '/prices'):
                                 live.enqueue_send(chat['id'])
