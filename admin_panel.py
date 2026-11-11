@@ -222,7 +222,7 @@ class AdminPanel:
                     else:
                         self.configure(uid, args)
                 if time.monotonic() >= check:
-                    check = time.monotonic()+5
+                    check = time.monotonic()+30
                     self.tick()
             except Exception as error:
                 logging.warning('Admin worker: %s', error)
