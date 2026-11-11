@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><style>
+body{margin:0;padding:12px;font-family:system-ui;color:var(--tg-theme-text-color)}h3{margin:0;font-size:17px}.hint{font-size:11px;color:var(--tg-theme-hint-color)}.card{margin:12px 0;padding:10px;border-radius:12px;background:var(--tg-theme-secondary-bg-color)}.status{font-size:14px;font-weight:bold}.on{color:#228754}.off{color:var(--tg-theme-hint-color)}.row{display:flex;align-items:center;justify-content:center;gap:8px;margin:8px 0}.row button{padding:7px 10px}.clock{font-size:32px;font-weight:bold;font-family:monospace;min-width:104px;text-align:center}.actions{display:flex;gap:8px;margin-top:12px}.actions button{flex:1;padding:10px}.note{margin-top:8px;min-height:14px;padding-bottom:max(8px,env(safe-area-inset-bottom));padding-right:max(12px,var(--tg-content-safe-area-corner-right))}
+</style><h3>Уведомления с ценами</h3><div class="hint">Каждый день в выбранное время придёт виджет /widget</div><div class="card"><div id="status" class="status">Загрузка…</div><div id="next" class="hint"></div></div><div class="hint">Время отправки по Москве</div><div class="row"><button id="hm">−1 ч</button><span id="clock" class="clock">09:00</span><button id="hp">+1 ч</button></div><div class="row"><button id="m5">−5 мин</button><button id="m1">−1</button><button id="p1">+1</button><button id="p5">+5 мин</button></div><div class="actions"><button id="save">Включить</button><button id="off">Отключить</button></div><div id="note" class="hint note"></div><script>
+const W=window.TelegramWidget;let S=null,h=9,m=0,busy=false,msg='';
+const ids=['hm','hp','m5','m1','p1','p5','save'];
+function $(id){return document.getElementById(id);}
+function text(id,v){$(id).textContent=v;}
+function pad(n){return ('0'+n).slice(-2);}
+function draw(){text('clock',pad(h)+':'+pad(m));const on=!!(S&&S.on);text('status',S?(on?'Включены · каждый день в '+pad(S.h)+':'+pad(S.m)+' МСК':'Отключены'):'Загрузка…');$('status').className='status '+(on?'on':'off');text('next',on?'Следующее: '+S.next+' МСК':(S?'Уведомления не приходят':''));text('save',on?'Изменить время':'Включить');text('note',msg);ids.forEach(function(id){$(id).disabled=busy;});$('off').disabled=busy||!on;}
+function move(d){if(busy)return;const t=((h*60+m+d)%1440+1440)%1440;h=Math.floor(t/60);m=t%60;msg='';draw();}
+function ask(data,done,wait){if(busy)return;busy=true;msg=wait;draw();W.request(data).then(function(a){busy=false;let n=null;try{n=JSON.parse(a.result||'null');}catch(e){}if(n&&typeof n.on==='boolean'){S=n;if(n.on){h=n.h;m=n.m;}msg=done;}else{msg='Не удалось выполнить. Повторите.';}draw();},function(){busy=false;msg='Нет ответа от бота. Повторите.';draw();});}
+$('hm').onclick=function(){move(-60);};$('hp').onclick=function(){move(60);};$('m5').onclick=function(){move(-5);};$('m1').onclick=function(){move(-1);};$('p1').onclick=function(){move(1);};$('p5').onclick=function(){move(5);};
+$('save').onclick=function(){ask('notify:set:'+pad(h)+':'+pad(m),'Сохранено','Сохраняю…');};
+$('off').onclick=function(){ask('notify:off','Уведомления отключены','Отключаю…');};
+try{const n=JSON.parse(W.chatData||'null');if(n&&typeof n.on==='boolean'){S=n;h=n.h;m=n.m;}}catch(e){}
+draw();ask('notify:get','','');
+</script>

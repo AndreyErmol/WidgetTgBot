@@ -24,9 +24,9 @@ SAVED = {}
 
 
 class APIError(Exception):
-    def __init__(self, message, limited=False, retry=0):
+    def __init__(self, message, limited=False, retry=0, code=0):
         super().__init__(message)
-        self.limited, self.retry = limited, retry
+        self.limited, self.retry, self.code = limited, retry, code
 
 
 def retry_seconds(value):
@@ -48,13 +48,17 @@ def json_request(url, params=None, timeout=None):
         with urlopen(request, timeout=seconds) as response:
             return json.load(response)
     except HTTPError as error:
-        retry = retry_seconds(error.headers.get('Retry-After'))
+        retry, detail = retry_seconds(error.headers.get('Retry-After')), ''
         try:
             payload = json.loads(error.read(8192))
             retry = max(retry, retry_seconds(payload.get('parameters', {}).get('retry_after')))
+            detail = str(payload.get('description', ''))[:200]
         except (ValueError, AttributeError):
             pass
-        raise APIError(f'HTTP {error.code}', error.code == 429, retry) from None
+        message = f'HTTP {error.code}' + (f': {detail}' if detail else '')
+        if TOKEN:
+            message = message.replace(TOKEN, '<redacted>')
+        raise APIError(message, error.code == 429, retry, error.code) from None
     except (URLError, OSError, ValueError) as error:
         detail = str(getattr(error, 'reason', error))
         if TOKEN:
@@ -78,13 +82,14 @@ def api(method, **params):
         if not payload.get('ok'):
             raise APIError(str(payload.get('description', 'Telegram error')).replace(TOKEN, '<redacted>'),
                            payload.get('error_code') == 429,
-                           retry_seconds(payload.get('parameters', {}).get('retry_after')))
+                           retry_seconds(payload.get('parameters', {}).get('retry_after')),
+                           payload.get('error_code') or 0)
         return payload['result']
     except APIError as error:
         if error.limited:
             with TG_LOCK:
                 TG_UNTIL = max(TG_UNTIL, time.monotonic() + max(1, error.retry or 60))
-        raise APIError(f'Telegram/{method}: {error}', error.limited, error.retry) from None
+        raise APIError(f'Telegram/{method}: {error}', error.limited, error.retry, error.code) from None
 
 
 def finite(value, positive=False):
@@ -192,6 +197,7 @@ def restore(saved):
 def main():
     from admin_panel import AdminPanel
     from live_updates import LiveController
+    from user_notifications import PriceNotifications
     from widget_stats import WidgetStats, record_widget_request
     global TOKEN
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -210,11 +216,12 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Bybit Spot/USDT, Coinbase USD/RUB and admin statistics.', me.get('username'))
-    with LiveController(sys.modules[__name__]) as live, AdminPanel(sys.modules[__name__], stats.path) as admin:
+    logging.info('Started @%s. Bybit Spot/USDT, Coinbase USD/RUB, statistics and price notifications.', me.get('username'))
+    notify = PriceNotifications(sys.modules[__name__], stats.path, allowed)
+    with LiveController(sys.modules[__name__]) as live, AdminPanel(sys.modules[__name__], stats.path) as admin, notify:
         while True:
             try:
-                params = {'timeout': 25, 'allowed_updates': ['message', 'widget_query', 'shared_widget_query']}
+                params = {'timeout': 25, 'allowed_updates': ['message', 'widget_query', 'shared_widget_query', 'my_chat_member']}
                 if offset is not None:
                     params['offset'] = offset
                 updates = api('getUpdates', **params)
@@ -222,14 +229,16 @@ def main():
                     try:
                         if 'widget_query' in update:
                             query = update['widget_query']
-                            if not admin.handle_query(query):
+                            if not admin.handle_query(query) and not notify.handle_query(query):
                                 live.handle_query(query, allowed)
                         elif 'shared_widget_query' in update:
                             query = update['shared_widget_query']
                             if not admin.handle_query(query, shared=True):
                                 live.handle_query(query, allowed, shared=True)
+                        elif 'my_chat_member' in update:
+                            notify.handle_member(update['my_chat_member'])
                     except Exception as error:
-                        logging.warning('Query handling: %s', error)
+                        logging.warning('Update handling: %s', error)
                 for update in updates:
                     record_widget_request(stats, me['id'], update)
                     message = update.get('message', {})
@@ -237,7 +246,7 @@ def main():
                     words = message.get('text', '').split()
                     command = words[0].split('@')[0] if words else ''
                     user_id = message.get('from', {}).get('id')
-                    if command in ('/widget', '/prices', '/start', '/help', '/statistic', '/notification'):
+                    if command in ('/widget', '/prices', '/start', '/help', '/statistic', '/notification', '/notificationsettings'):
                         logging.info('Command update=%s user=%s command=%s', update['update_id'], user_id, command)
                     if admin.handle_message(message):
                         pass
@@ -245,8 +254,10 @@ def main():
                         try:
                             if command in ('/widget', '/prices'):
                                 live.enqueue_send(chat['id'])
+                            elif command == '/notificationsettings':
+                                notify.enqueue_settings(chat['id'])
                             elif command in ('/start', '/help'):
-                                api('sendMessage', chat_id=chat['id'], text='/widget — CryptunaPriceWidget. Цены Bybit Spot в USDT обновляются, пока виджет виден.')
+                                api('sendMessage', chat_id=chat['id'], text='/widget — цены Bybit Spot в USDT, пока виджет виден.\n/notificationsettings — ежедневный виджет с ценами в выбранное время по МСК.')
                         except Exception as error:
                             logging.error('Command: %s', error)
                     offset = update['update_id'] + 1
