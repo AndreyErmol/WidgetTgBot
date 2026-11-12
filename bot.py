@@ -41,7 +41,7 @@ def retry_seconds(value):
 
 def json_request(url, params=None, timeout=None):
     body = None if params is None else json.dumps(params).encode()
-    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/7',
+    request = Request(url, data=body, headers={'User-Agent': 'CryptunaPriceWidget/8',
                                               'Content-Type': 'application/json'})
     try:
         seconds = timeout if timeout is not None else (40 if params is not None else 8)
@@ -52,13 +52,13 @@ def json_request(url, params=None, timeout=None):
         try:
             payload = json.loads(error.read(8192))
             retry = max(retry, retry_seconds(payload.get('parameters', {}).get('retry_after')))
-            detail = str(payload.get('description', ''))[:200]
+            detail = str(payload.get('description') or payload.get('msg') or '')[:200]
         except (ValueError, AttributeError):
             pass
         message = f'HTTP {error.code}' + (f': {detail}' if detail else '')
         if TOKEN:
             message = message.replace(TOKEN, '<redacted>')
-        raise APIError(message, error.code == 429, retry, error.code) from None
+        raise APIError(message, error.code in (418, 429), retry, error.code) from None
     except (URLError, OSError, ValueError) as error:
         detail = str(getattr(error, 'reason', error))
         if TOKEN:
@@ -119,22 +119,21 @@ def format_percent(value):
 def pack():
     with LOCK:
         snapshot, coins = dict(STATE), [dict(c) for c in STATE['coins']]
-    for size in (20, 12, 6, 0):
-        rows = [[c['id'], c['name'][:size], c['symbol'], c['rank'],
-                 format_price(c['p']) if c['p'] is not None else None,
-                 format_percent(c['c']) if c['c'] is not None else None,
-                 int(c['c'] >= 0) if c['c'] is not None else None, c.get('t',0)] for c in coins]
-        state = {'r': time.time_ns() // 1000, 't': snapshot['ct'], 'q': rows,
-                 'f': format_price(snapshot['fx']) if snapshot['fx'] else None, 'ft':snapshot['ft']}
-        text = json.dumps(state, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-        if len(text.encode()) <= 1024:
-            return text
-    raise ValueError('State exceeds 1024 bytes')
+    rows = [[c['id'], c['symbol'],
+             format_price(c['p']) if c['p'] is not None else None,
+             format_percent(c['c']) if c['c'] is not None else None,
+             int(c['c'] >= 0) if c['c'] is not None else None, c.get('t', 0)] for c in coins]
+    state = {'r': time.time_ns() // 1000, 't': snapshot['ct'], 'q': rows,
+             'f': format_price(snapshot['fx']) if snapshot['fx'] else None}
+    text = json.dumps(state, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    if len(text.encode()) > 1024:
+        raise ValueError('State exceeds 1024 bytes')
+    return text
 
 
 def persist():
     with LOCK:
-        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=7, quote_source=SOURCE)
+        data = dict(SAVED, state=STATE, bot=TOKEN.split(':')[0], version=8, quote_source=SOURCE)
         tmp = DATA_DIR / 'runtime.json.tmp'
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
         tmp.replace(DATA_DIR / 'runtime.json')
@@ -147,11 +146,11 @@ def refresh_on_demand():
             with LOCK:
                 STATE.update(coins=coins, ct=stamp)
         except Exception as error:
-            logging.warning('Bybit snapshot: %s; keeping previous prices',error)
+            logging.warning('Market snapshot: %s; keeping previous prices', error)
     if STATE['fx'] is None or time.time() - STATE['ft'] >= 60:
-        rate,stamp = MARKET.rate()
+        rate, stamp = MARKET.rate()
         with LOCK:
-            STATE.update(fx=rate,ft=stamp)
+            STATE.update(fx=rate, ft=stamp)
 
 
 def send_widget(chat_id):
@@ -185,11 +184,11 @@ def send_widget(chat_id):
 def restore(saved):
     if saved.get('bot') != TOKEN.split(':')[0]:
         return
-    old = saved.get('state', {}) if saved.get('version') in (4,5,6,7) else saved
-    compatible = saved.get('version') == 7 and saved.get('quote_source') == SOURCE
-    MARKET.seed(old.get('coins',[]) if compatible else [],old.get('fx'),old.get('ft',0))
-    coins,stamp = MARKET.cached()
-    STATE.update(coins=coins,ct=stamp,fx=MARKET.fx.data,ft=MARKET.fx.stamp)
+    old = saved.get('state', {}) if saved.get('version') in (4, 5, 6, 7, 8) else saved
+    compatible = saved.get('version') == 8 and saved.get('quote_source') == SOURCE
+    MARKET.seed(old.get('coins', []) if compatible else [], old.get('fx'), old.get('ft', 0))
+    coins, stamp = MARKET.cached()
+    STATE.update(coins=coins, ct=stamp, fx=MARKET.fx.data, ft=MARKET.fx.stamp)
     if compatible:
         SAVED.update(saved)
 
@@ -216,7 +215,7 @@ def main():
     if api('getWebhookInfo').get('url'):
         raise SystemExit('Remove existing webhook before long polling.')
     offset = None
-    logging.info('Started @%s. Bybit Spot/USDT, Coinbase USD/RUB, statistics and price notifications.', me.get('username'))
+    logging.info('Started @%s. Binance Spot and Futures USDT, Coinbase USD/RUB, statistics and price notifications.', me.get('username'))
     notify = PriceNotifications(sys.modules[__name__], stats.path, allowed)
     with LiveController(sys.modules[__name__]) as live, AdminPanel(sys.modules[__name__], stats.path) as admin, notify:
         while True:
@@ -257,7 +256,7 @@ def main():
                             elif command == '/notificationsettings':
                                 notify.enqueue_settings(chat['id'])
                             elif command in ('/start', '/help'):
-                                api('sendMessage', chat_id=chat['id'], text='/widget — цены Bybit Spot в USDT, пока виджет виден.\n/notificationsettings — ежедневный виджет с ценами в выбранное время по МСК.')
+                                api('sendMessage', chat_id=chat['id'], text='/widget — цены Binance в USDT и фьючерсы на металлы, пока виджет виден.\n/notificationsettings — ежедневный виджет с ценами в выбранное время по МСК.')
                         except Exception as error:
                             logging.error('Command: %s', error)
                     offset = update['update_id'] + 1
