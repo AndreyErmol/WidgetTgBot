@@ -1,5 +1,3 @@
-import hashlib
-import json
 import logging
 import threading
 from collections import deque
@@ -42,12 +40,8 @@ class LiveController:
                 self.condition.notify()
 
     def handle_query(self, query, allowed_user=0, shared=False):
-        with self.app.LOCK:
-            expected_id = self.app.SAVED.get('widget_id')
         valid = (not shared and query.get('chat', {}).get('type') == 'private'
                  and query.get('data') == 'refresh'
-                 and expected_id is not None
-                 and str(query.get('widget_id')) == str(expected_id)
                  and (not allowed_user or query.get('from', {}).get('id') == allowed_user))
         params = {'widget_query_id': query['id']}
         if valid:
@@ -60,20 +54,6 @@ class LiveController:
             return
         if valid:
             self.request_refresh()
-
-    def publish(self):
-        state = self.app.pack()
-        content = json.loads(state)
-        content.pop('r', None)
-        digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
-        with self.app.LOCK:
-            widget_id = self.app.SAVED.get('widget_id')
-            previous = self.app.SAVED.get('content_hash')
-        if widget_id and previous != digest:
-            self.app.api('editSharedWidgetData', widget_id=widget_id, public_data=state, cache_time=10)
-            with self.app.LOCK:
-                self.app.SAVED['content_hash'] = digest
-        self.app.persist()
 
     def _run(self):
         while True:
@@ -89,6 +69,5 @@ class LiveController:
                 else:
                     self.app.refresh_on_demand()
                     self.app.persist()
-                    self.publish()
             except Exception as error:
                 logging.warning('Demand worker: %s', error)
