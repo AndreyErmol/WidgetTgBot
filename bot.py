@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -160,8 +161,24 @@ def send_widget(chat_id):
         raw = markup.encode()
         if len(raw) > 32768 or len(zlib.compress(raw, 9)) > 4096 or b'\x00' in raw:
             raise ValueError('HTML exceeds Telegram limits')
-        api('sendWidget', chat_id=chat_id, html=markup, width=360, height=0,
-            allow_queries=True, public_data=pack())
+        digest, state = hashlib.sha256(raw).hexdigest(), pack()
+        content = json.loads(state)
+        content.pop('r', None)
+        content_hash = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        widget_id = SAVED.get('widget_id') if SAVED.get('template') == digest else None
+        if widget_id:
+            if SAVED.get('content_hash') != content_hash:
+                try:
+                    api('editSharedWidgetData', widget_id=widget_id, public_data=state, cache_time=10)
+                    SAVED['content_hash'] = content_hash
+                except APIError as error:
+                    logging.warning('Shared data update failed: %s', error)
+            api('sendSharedWidget', chat_id=chat_id, widget_id=widget_id)
+        else:
+            result = api('sendWidget', chat_id=chat_id, html=markup, width=360, height=0,
+                         is_shared=True, allow_queries=True, public_data=state)
+            SAVED.update(widget_id=result['widget']['id'], template=digest, content_hash=content_hash)
+        persist()
 
 
 def restore(saved):

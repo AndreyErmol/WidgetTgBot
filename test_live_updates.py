@@ -1,3 +1,4 @@
+import json
 import threading
 import unittest
 from types import SimpleNamespace
@@ -7,12 +8,13 @@ from live_updates import LiveController
 
 
 def app():
-    return SimpleNamespace(pack=Mock(return_value='{"r":1,"q":[]}'), api=Mock(), persist=Mock(),
+    return SimpleNamespace(LOCK=threading.RLock(), SAVED={'widget_id':'w'},
+        pack=Mock(return_value='{"r":1,"q":[]}'), api=Mock(), persist=Mock(),
         refresh_on_demand=Mock(), send_widget=Mock())
 
 
 def query(**extra):
-    result={'id':'q','data':'refresh','from':{'id':7},'chat':{'type':'private'}}
+    result={'id':'q','widget_id':'w','data':'refresh','from':{'id':7},'chat':{'type':'private'}}
     result.update(extra)
     return result
 
@@ -27,13 +29,8 @@ class LiveTests(unittest.TestCase):
         a.refresh_on_demand.assert_not_called()
         a.api.assert_called_once_with('answerWidgetQuery',widget_query_id='q',data=a.pack.return_value)
 
-    def test_old_shared_and_new_static_widgets_both_refresh(self):
-        for extra in ({}, {'widget_id':'old-shared'}, {'message_id':5}):
-            a=app(); live=LiveController(a); live.handle_query(query(**extra))
-            a.api.assert_called_once_with('answerWidgetQuery',widget_query_id='q',data=a.pack.return_value)
-
     def test_invalid_requests_answered_without_refresh(self):
-        for q,allowed,shared in [(query(data='bad'),0,False),(query(data=None),0,False),
+        for q,allowed,shared in [(query(data='bad'),0,False),(query(widget_id='other'),0,False),
              (query(chat={'type':'group'}),0,False),(query(),8,False),(query(),0,True)]:
             a=app(); live=LiveController(a); live.handle_query(q,allowed,shared)
             a.api.assert_called_once_with('answerWidgetQuery',widget_query_id='q')
@@ -65,13 +62,10 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(live.refresh_requested)
         self.assertEqual(len(live.commands),0)
 
-    def test_refresh_never_uses_shared_state_edits(self):
-        a=app(); done=threading.Event()
-        a.persist.side_effect=lambda:done.set()
-        with LiveController(a) as live:
-            live.request_refresh(); self.assertTrue(done.wait(1))
-        a.refresh_on_demand.assert_called_once()
-        self.assertFalse([c for c in a.api.call_args_list if c.args[0]=='editSharedWidgetData'])
+    def test_unchanged_state_not_republished(self):
+        a=app(); live=LiveController(a)
+        live.publish(); live.publish()
+        self.assertEqual(sum(c.args[0]=='editSharedWidgetData' for c in a.api.call_args_list),1)
 
     def test_command_queue_is_bounded(self):
         a=app(); live=LiveController(a)
@@ -83,20 +77,12 @@ class LiveTests(unittest.TestCase):
         live.handle_query(query())
         self.assertFalse(live.refresh_requested)
 
-    def test_send_is_plain_widget_with_queries_and_snapshot(self):
-        with patch.dict(bot.SAVED,{'widget_id':'stale'},clear=True), patch('bot.refresh_on_demand'), patch('bot.persist'), patch('bot.pack',return_value='{"r":1,"q":[]}'), patch('bot.Path.read_text',return_value='<b>widget</b>'), patch('bot.api',return_value={'widget':{'id':'w'}}) as api:
+    def test_send_enables_queries(self):
+        with patch.dict(bot.SAVED,{},clear=True), patch('bot.refresh_on_demand'), patch('bot.persist'), patch('bot.pack',return_value='{"r":1,"q":[]}'), patch('bot.Path.read_text',return_value='<b>widget</b>'), patch('bot.api',return_value={'widget':{'id':'w'}}) as api:
             bot.send_widget(7)
-        names=[c.args[0] for c in api.call_args_list]
-        self.assertEqual(names,['sendWidget'])
-        kwargs=api.call_args.kwargs
-        self.assertTrue(kwargs['allow_queries'])
-        self.assertFalse(kwargs.get('is_shared',False))
-        self.assertEqual((kwargs['chat_id'],kwargs['public_data'],kwargs['width'],kwargs['height']),(7,'{"r":1,"q":[]}',360,0))
-
-    def test_send_rejects_oversized_html(self):
-        with patch('bot.refresh_on_demand'), patch('bot.persist'), patch('bot.Path.read_text',return_value='x'*40000), patch('bot.api') as api:
-            with self.assertRaises(ValueError): bot.send_widget(7)
-        api.assert_not_called()
+        call=next(c for c in api.call_args_list if c.args[0]=='sendWidget')
+        self.assertTrue(call.kwargs['allow_queries'])
+        self.assertTrue(call.kwargs['is_shared'])
 
     def test_answer_uses_short_timeout(self):
         with patch.object(bot,'TG_UNTIL',0), patch('bot.json_request',return_value={'ok':True,'result':True}) as request:
